@@ -75,6 +75,7 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 
 .field { display: block; margin-bottom: 10px; }
 .field > span { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 4px; }
+select,
 input[type=text], input[type=number], textarea {
   font: inherit;
   width: 100%;

@@ -25,6 +25,52 @@ the architecture walkthrough — is preserved at
 
 ---
 
+## Try it in a browser
+
+**https://shi3z.github.io/voxcpm2web/**
+
+GitHub Pages serves the page over HTTPS — a secure context, which WebGPU
+requires — and the weights stream in from Hugging Face. What it needs
+from you:
+
+1. A GPU with the VRAM for the weights (see [Requirements](#requirements)).
+2. **One file you have to supply: `audiovae.safetensors`.** Upstream
+   publishes the AudioVAE only as `audiovae.pth`, a Python pickle this
+   build cannot read, and no `.safetensors` version is hosted anywhere
+   public. Convert it once (below) and select it in the page — it is read
+   in the tab and never uploaded. Or host your converted copy somewhere
+   that sends CORS headers (a Hugging Face repo works; **GitHub release
+   assets do not** — they answer `404` to the preflight and send no
+   `Access-Control-Allow-Origin`) and paste the URL.
+
+### Why the model is not hosted on GitHub
+
+It cannot be. GitHub rejects any single file over **100 MB**, and a Pages
+site is capped at **1 GB**; `model.safetensors` is **4.37 GB**. Git LFS
+does not help either — Pages does not resolve LFS pointers.
+
+Hugging Face does work, and this was verified rather than assumed:
+
+```
+OPTIONS .../model.safetensors   (Origin: https://shi3z.github.io, Request-Headers: range)
+  → 200, access-control-allow-headers: range
+         access-control-expose-headers: ..., Accept-Ranges, Content-Range
+
+GET     .../model.safetensors   (Range: bytes=0-99)
+  → 206, content-range: bytes 0-99/4580080592
+         access-control-allow-origin: *
+```
+
+`Range` is not a CORS-safelisted header, so it triggers a preflight —
+that preflight passing is the whole reason this works at all.
+
+Measured end to end, with the page on one origin and the checkpoint on
+Hugging Face: **474 s** to load, `applied=632, missing=0, unused=0,
+errors=0`. That is 4.4 GB over the public internet, so your mileage is
+your bandwidth. There is no local cache yet, so a reload re-downloads.
+
+---
+
 ## Status
 
 | | |
@@ -96,6 +142,39 @@ for correctness testing.
 
 ---
 
+## Switching between F32 and F16
+
+Precision is a **build-time** switch: `B::FloatElem` is a type parameter,
+so the two are separate wasm modules.
+
+```bash
+scripts/build-web.sh          # F32 -> web/pkg
+scripts/build-web.sh --f16    # F16 -> web/pkg-f16
+scripts/build-web.sh --both   # both, and the page chooses
+```
+
+With `--both` deployed, the page's **Weight precision** selector offers:
+
+| | |
+| --- | --- |
+| Auto *(default)* | F16 when the adapter reports `shader-f16`, else F32 |
+| F16 | 4.37 GB of VRAM. Refused with an explicit message if `shader-f16` is missing |
+| F32 | 8.74 GB of VRAM. The correctness reference |
+
+Changing it reloads the page with `?precision=…`, because the GPU device
+is already registered with cubecl by then and swapping modules in place
+is not safe.
+
+F16 halves both the VRAM and the peak WASM heap, and is what makes this
+reach an 8 GB laptop GPU rather than needing a 12 GB card. It is wired
+and it builds, but **it has not been verified numerically** — the test
+machine's browser only ever got a SwiftShader adapter, which has no
+`shader-f16`. The thing to watch is the AudioVAE's transposed
+convolutions, which sum ~32k products per output; that is the reduction
+that collapsed in BF16 and motivated the vendored `burn-cubecl` patch.
+That patch accumulates in F32 regardless of element type, so it should
+cover F16 too — but should is not the same as does.
+
 ## Quick start
 
 ```bash
@@ -114,9 +193,8 @@ huggingface-cli download openbmb/VoxCPM2 --local-dir ./VoxCPM2
 cargo run --release --example convert_audiovae \
     --no-default-features --features cpu -- ./VoxCPM2
 
-# 4. build the browser bundle
-scripts/build-web.sh            # F32  (≥12 GB VRAM)
-scripts/build-web.sh --f16      # F16  (≥8 GB VRAM)
+# 4. build the browser bundle(s)
+scripts/build-web.sh --both     # F32 and F16; the page picks
 
 # 5. serve it
 python3 scripts/serve.py --model ./VoxCPM2

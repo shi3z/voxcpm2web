@@ -5,7 +5,11 @@
 // comes back through WebAudio. No WAV encoding on the hot path — Rust
 // hands back a Float32Array and it goes straight into an AudioBuffer.
 
-import init, * as vox from './pkg/voxcpm_rs.js';
+// The wasm bundle is loaded dynamically, because weight precision is a
+// build-time switch: `B::FloatElem` is a type parameter, so F16 and F32
+// are two separate modules (`scripts/build-web.sh --both`). Picking one
+// here is what lets the page offer the choice without a rebuild.
+let vox = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -23,6 +27,12 @@ const els = {
   refFile: $('ref-file'),
   refStatus: $('ref-status'),
   modelUrl: $('model-url'),
+  precision: $('precision'),
+  sourcePreset: $('source-preset'),
+  vaeUrl: $('vae-url'),
+  vaeFile: $('vae-file'),
+  clearVae: $('btn-clear-vae'),
+  vaeStatus: $('vae-status'),
   text: $('text'),
   cfg: $('cfg'),
   timesteps: $('timesteps'),
@@ -55,6 +65,24 @@ let nextChunkTime = 0;  // AudioContext time the next chunk should start at
 let underruns = 0;      // chunks that arrived after their slot had passed
 let reference = null;   // { samples: Float32Array, sampleRate: number }
 let recorder = null;
+let vaeBytes = null;    // AudioVAE supplied from a local file, if any
+
+// Where the weights come from. The checkpoint is 4.37 GB, which no
+// GitHub Pages site can host (100 MB per file, 1 GB per site), but
+// Hugging Face serves Range requests with CORS — so the page and the
+// weights can live in different places.
+const SOURCE_PRESETS = {
+  local: {
+    base: '/models',
+    vae: '/models/audiovae.safetensors',
+  },
+  hf: {
+    base: 'https://huggingface.co/openbmb/VoxCPM2/resolve/main',
+    // Deliberately blank: there is no public safetensors AudioVAE to
+    // point at, so the user supplies one.
+    vae: '',
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Status log
@@ -185,6 +213,36 @@ async function fillDiagnostics() {
 // Boot
 // ---------------------------------------------------------------------------
 
+// Load the F16 or F32 bundle. Returns the resolved precision.
+//
+// `--both` deploys `pkg/` (F32) and `pkg-f16/` (F16); a build of only one
+// leaves the other absent, so a missing bundle falls back rather than
+// failing.
+async function loadWasm(want, shaderF16) {
+  const order =
+    want === 'f16' ? ['f16']
+    : want === 'f32' ? ['f32']
+    : shaderF16 ? ['f16', 'f32']
+    : ['f32'];
+
+  let lastErr = null;
+  for (const p of order) {
+    const dir = p === 'f16' ? './pkg-f16' : './pkg';
+    try {
+      const mod = await import(`${dir}/voxcpm_rs.js`);
+      // `init()` resolves to the wasm exports, which is where `memory`
+      // lives — that is what the heap readout reports.
+      const exports = await mod.default();
+      vox = mod;
+      return { precision: p, dir, exports };
+    } catch (e) {
+      lastErr = e;
+      say(`${dir} unavailable (${(e && e.message) || e}) — trying the next bundle.`);
+    }
+  }
+  throw lastErr || new Error('no wasm bundle could be loaded');
+}
+
 async function boot() {
   const gpu = await fillDiagnostics();
 
@@ -216,8 +274,16 @@ async function boot() {
   }
 
   try {
-    wasm = await init();
+    const want = els.precision.value;
+    const shaderF16 = !!(gpu && gpu.shaderF16);
+    if (want === 'f16' && !shaderF16) {
+      say('F16 was requested but this adapter does not report shader-f16. ' +
+          'It will load and then refuse — pick Auto or F32.', 'error');
+    }
+    const chosen = await loadWasm(want, shaderF16);
+    wasm = chosen.exports;
     vox.init('info');
+    say(`loaded the ${chosen.precision.toUpperCase()} bundle from ${chosen.dir}.`);
     // Rust cannot see who the adapter is on the WebGPU backend; tell it.
     if (gpu) {
       vox.set_adapter_hint(
@@ -244,6 +310,54 @@ async function boot() {
 // ---------------------------------------------------------------------------
 // Milestone 2: self-test
 // ---------------------------------------------------------------------------
+
+function applySourcePreset() {
+  const p = SOURCE_PRESETS[els.sourcePreset.value];
+  if (!p) return;
+  els.modelUrl.value = p.base;
+  els.vaeUrl.value = p.vae;
+  if (els.sourcePreset.value === 'hf' && !vaeBytes) {
+    // Open the section, because this is the one thing the user has to do.
+    $('vae-details').open = true;
+    say('streaming weights from Hugging Face. The AudioVAE has no public ' +
+        'safetensors host — select your converted file below, or give a URL.');
+  }
+}
+
+els.sourcePreset.addEventListener('change', applySourcePreset);
+
+els.precision.addEventListener('change', () => {
+  // The module is already instantiated and the GPU device is registered
+  // with cubecl, so swapping bundles in place is not safe. Reload.
+  say('precision changed — reloading the page to load the other bundle.');
+  const u = new URL(location.href);
+  u.searchParams.set('precision', els.precision.value);
+  location.assign(u.toString());
+});
+
+els.vaeFile.addEventListener('change', async () => {
+  const file = els.vaeFile.files?.[0];
+  if (!file) return;
+  try {
+    const buf = await file.arrayBuffer();
+    vaeBytes = new Uint8Array(buf);
+    els.clearVae.disabled = false;
+    els.vaeStatus.textContent =
+      `Using ${file.name} (${fmtBytes(vaeBytes.length)}) from this machine. ` +
+      'It is read in the tab and never uploaded.';
+    say(`AudioVAE loaded from ${file.name} (${fmtBytes(vaeBytes.length)}).`);
+  } catch (e) {
+    fail('could not read the AudioVAE file', e);
+  }
+});
+
+els.clearVae.addEventListener('click', () => {
+  vaeBytes = null;
+  els.vaeFile.value = '';
+  els.clearVae.disabled = true;
+  els.vaeStatus.textContent = 'Using the URL above.';
+  say('AudioVAE file cleared — will fetch from the URL instead.');
+});
 
 els.stream.addEventListener('change', () => {
   els.chunkField.hidden = !els.stream.checked;
@@ -298,7 +412,18 @@ els.selftest.addEventListener('click', async () => {
 els.load.addEventListener('click', async () => {
   els.load.disabled = true;
   els.loadProgress.hidden = false;
+
   const base = els.modelUrl.value.trim() || '/models';
+  const vaeUrl = els.vaeUrl.value.trim();
+  if (!vaeBytes && !vaeUrl) {
+    els.load.disabled = false;
+    say('no AudioVAE source: give a URL or select the converted ' +
+        'audiovae.safetensors under "AudioVAE source".', 'error');
+    return;
+  }
+  const sources = { base };
+  if (vaeUrl) sources.audiovae = vaeUrl;
+
   say(`loading model from ${base} — 4.4 GB streamed by HTTP Range, never held whole in WASM memory.`);
 
   const t0 = performance.now();
@@ -318,7 +443,15 @@ els.load.addEventListener('click', async () => {
   };
 
   try {
-    session = await vox.load_model(base, onProgress, undefined);
+    session = await vox.load_model(
+      JSON.stringify(sources),
+      vaeBytes || undefined,
+      onProgress,
+      undefined,
+    );
+    // The bytes are on the GPU now; let the 359 MB copy go.
+    vaeBytes = null;
+    els.clearVae.disabled = true;
     sampleRate = session.sample_rate;
     const secs = (performance.now() - t0) / 1000;
     metric('m-load', `${secs.toFixed(1)} s`);
@@ -599,4 +732,13 @@ els.save.addEventListener('click', () => {
 });
 
 setReference(null);
+// A page served from anywhere but the host itself has no /models to read,
+// so default to Hugging Face.
+const wantedPrecision = new URL(location.href).searchParams.get('precision');
+if (wantedPrecision && ['auto', 'f16', 'f32'].includes(wantedPrecision)) {
+  els.precision.value = wantedPrecision;
+}
+const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+els.sourcePreset.value = isLocal ? 'local' : 'hf';
+applySourcePreset();
 boot();

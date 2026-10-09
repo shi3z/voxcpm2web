@@ -1,0 +1,127 @@
+# Build the WASM + WebGPU bundles and publish the demo to GitHub Pages.
+#
+# What ends up on Pages is only the page: HTML, JS, CSS and the two wasm
+# bundles (~16 MB each). The model deliberately does not, and cannot —
+# GitHub rejects any single file over 100 MB and caps a Pages site at
+# 1 GB, while `model.safetensors` is 4.37 GB. The page streams it
+# cross-origin from Hugging Face instead, which serves HTTP Range requests
+# with `Access-Control-Allow-Origin` and exposes `Content-Range`.
+#
+# The one file with no public home is `audiovae.safetensors`: upstream
+# publishes only `audiovae.pth`, a Python pickle the browser build cannot
+# read, and no safetensors version is hosted anywhere. The page lets the
+# visitor select their own converted copy, or give a CORS-friendly URL.
+name: Deploy demo to Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'web/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'scripts/build-web.sh'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a newer push supersede an in-flight build, but never interrupt a
+# deployment half-way.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # `Cargo.toml` sets lto = "fat" + codegen-units = 1, which is the right
+  # trade for a shipped binary and far too slow on a 2-core runner. Thin
+  # LTO costs a little size and saves a lot of wall clock.
+  CARGO_PROFILE_RELEASE_LTO: thin
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust with the wasm target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+          rustc --version
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32-pages
+          cache-targets: 'true'
+
+      - name: Install wasm-bindgen-cli matching Cargo.lock
+        run: |
+          set -euo pipefail
+          WANT=$(awk '
+            /^name = "wasm-bindgen"$/ { f=1; next }
+            f && /^version = / { gsub(/[":]/,""); print $3; exit }
+          ' Cargo.lock)
+          echo "wasm-bindgen crate version: $WANT"
+          # A version mismatch between the CLI and the crate produces
+          # broken glue, so this is pinned rather than "latest".
+          URL="https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${WANT}/wasm-bindgen-${WANT}-x86_64-unknown-linux-musl.tar.gz"
+          if curl -sSfL "$URL" -o wb.tar.gz; then
+            tar xzf wb.tar.gz
+            install -Dm755 "wasm-bindgen-${WANT}-x86_64-unknown-linux-musl/wasm-bindgen" "$HOME/.cargo/bin/wasm-bindgen"
+          else
+            echo "no prebuilt binary for $WANT; building from source"
+            cargo install wasm-bindgen-cli --version "$WANT" --locked
+          fi
+          wasm-bindgen --version
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq binaryen
+          wasm-opt --version
+
+      - name: Build both precision bundles
+        run: scripts/build-web.sh --both
+
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          cp -r web/index.html web/main.js web/style.css web/pkg web/pkg-f16 site/
+          # Pages runs Jekyll by default, which would skip paths it does
+          # not like. This turns that off.
+          touch site/.nojekyll
+          echo "--- site contents ---"
+          find site -type f | sort
+          echo "--- total ---"
+          du -sh site
+
+      - uses: actions/configure-pages@v5
+        # Creates the Pages site on first run, so no manual switch in
+        # Settings is needed.
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

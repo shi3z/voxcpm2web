@@ -24,9 +24,44 @@
       <button id="btn-load" disabled>2. Load model</button>
     </div>
     <label class="field">
-      <span>Model base URL</span>
+      <span>Weight precision</span>
+      <select id="precision">
+        <option value="auto">Auto — F16 when the GPU supports shader-f16, else F32</option>
+        <option value="f16">F16 — 4.37 GB of VRAM, needs shader-f16</option>
+        <option value="f32">F32 — 8.74 GB of VRAM, the correctness reference</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Weights source</span>
+      <select id="source-preset">
+        <option value="local">Local server (/models) — needs scripts/serve.py</option>
+        <option value="hf">Hugging Face (streams the 4.37 GB checkpoint from openbmb/VoxCPM2)</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Base URL for <code>config.json</code>, <code>tokenizer.json</code>, <code>model.safetensors</code></span>
       <input id="model-url" type="text" value="/models" spellcheck="false">
     </label>
+    <details class="options" id="vae-details">
+      <summary>AudioVAE source</summary>
+      <p class="hint">
+        Upstream publishes the AudioVAE only as <code>audiovae.pth</code>, a Python
+        pickle this build cannot read, and no <code>.safetensors</code> version is
+        hosted anywhere public. Convert it once with the
+        <code>convert_audiovae</code> example, then either point at a CORS-friendly
+        host (a Hugging Face repo works — GitHub release assets do not) or just pick
+        the local file: it never leaves this tab.
+      </p>
+      <label class="field">
+        <span>URL</span>
+        <input id="vae-url" type="text" value="/models/audiovae.safetensors" spellcheck="false">
+      </label>
+      <div class="row">
+        <input id="vae-file" type="file" accept=".safetensors,application/octet-stream">
+        <button id="btn-clear-vae" type="button" disabled>Clear</button>
+      </div>
+      <p class="hint" id="vae-status">Using the URL above.</p>
+    </details>
     <label class="check">
       <input id="allow-software" type="checkbox">
       <span>Allow a <strong>software</strong> WebGPU adapter (SwiftShader / llvmpipe).

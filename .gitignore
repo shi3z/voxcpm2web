@@ -8,3 +8,4 @@ vendor/nanovllm-voxcpm/
 
 # Browser build output (produced by scripts/build-web.sh)
 /web/pkg/
+/web/pkg-f16/

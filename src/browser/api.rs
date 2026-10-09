@@ -488,37 +488,88 @@ pub struct VoxCpmSession {
     load_ms: f64,
 }
 
+/// Where each checkpoint file comes from.
+///
+/// Every field is an absolute URL or a path relative to the page. Any
+/// field left out falls back to `{base}/{filename}`, so the common
+/// same-origin case is just `{"base": "/models"}`.
+///
+/// Mixed sources are the point: a page on GitHub Pages cannot host a
+/// 4.37 GB file (GitHub rejects any single file over 100 MB, and a Pages
+/// site is capped at 1 GB), but it *can* stream the checkpoint
+/// cross-origin from Hugging Face, which serves `Range` requests with
+/// `Access-Control-Allow-Origin` and exposes `Content-Range`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct ModelSources {
+    /// Fallback prefix for any field not given.
+    base: Option<String>,
+    config: Option<String>,
+    tokenizer: Option<String>,
+    model: Option<String>,
+    audiovae: Option<String>,
+}
+
+impl ModelSources {
+    fn resolve(&self, field: &Option<String>, filename: &str) -> Result<String, JsValue> {
+        if let Some(u) = field {
+            return Ok(u.clone());
+        }
+        match &self.base {
+            Some(b) => Ok(format!("{}/{filename}", b.trim_end_matches('/'))),
+            None => Err(err(format!(
+                "no source for `{filename}`: give it explicitly or set `base`"
+            ))),
+        }
+    }
+}
+
 /// Download a checkpoint and build a model on the GPU.
 ///
-/// `base_url` is a directory containing:
+/// `sources_json` is a JSON object naming where each file lives — see
+/// [`ModelSources`]. The simplest form is `{"base":"/models"}`; to stream
+/// the weights from Hugging Face instead:
+///
+/// ```json
+/// {
+///   "base":  "https://huggingface.co/openbmb/VoxCPM2/resolve/main",
+///   "audiovae": "https://huggingface.co/you/your-repo/resolve/main/audiovae.safetensors"
+/// }
+/// ```
 ///
 /// | file | how it is read |
 /// |---|---|
 /// | `config.json` | whole |
 /// | `tokenizer.json` | whole |
 /// | `model.safetensors` | **streamed** via HTTP Range, group at a time |
-/// | `audiovae.safetensors` | whole (359 MB) |
+/// | `audiovae.safetensors` | whole (359 MB), or handed in as `audiovae_bytes` |
 ///
 /// `model.safetensors` is 4.37 GB and `wasm32` has 4 GB of address space,
 /// so it is never materialized: only its header is parsed up front, then
-/// tensors are fetched, converted and uploaded in batches. The server must
-/// honour `Range` requests; the loader fails with a clear message if it
-/// does not.
+/// tensors are fetched, converted and uploaded in batches. Whatever serves
+/// it must honour `Range` requests; the loader fails with a clear message
+/// if it does not.
 ///
-/// `audiovae.safetensors` is required — upstream ships `audiovae.pth`, a
-/// Python pickle read through a path-based reader. Convert it once with
-/// the `convert_audiovae` example.
+/// `audiovae_bytes` lets the page supply the AudioVAE directly — from an
+/// `<input type="file">`, Cache Storage, or OPFS — which is the way out of
+/// a real hosting problem: upstream ships only `audiovae.pth`, a Python
+/// pickle this build cannot read, and no safetensors version of it is
+/// published anywhere. Convert it once with the `convert_audiovae`
+/// example, then either host the result somewhere CORS-friendly or just
+/// pick the local file.
 ///
 /// `progress` is an optional `(stage, done, total, detail) => void`.
 #[wasm_bindgen]
 pub async fn load_model(
-    base_url: String,
+    sources_json: String,
+    audiovae_bytes: Option<js_sys::Uint8Array>,
     progress: Option<js_sys::Function>,
     batch_budget_bytes: Option<f64>,
 ) -> Result<VoxCpmSession, JsValue> {
     let t_total = crate::compat::Stopwatch::start();
     let p = JsProgress { callback: progress };
-    let base = base_url.trim_end_matches('/').to_string();
+    let sources: ModelSources = serde_json::from_str(&sources_json)
+        .map_err(|e| err(format!("bad model sources JSON: {e}")))?;
     let budget = batch_budget_bytes
         .filter(|b| *b >= 1.0)
         .map(|b| b as u64)
@@ -530,18 +581,16 @@ pub async fn load_model(
     let device = Device::default();
 
     // --- config.json ------------------------------------------------------
-    p.stage("config", "downloading config.json");
-    let config_bytes = super::fetch::fetch_bytes(&format!("{base}/config.json"))
-        .await
-        .map_err(to_js)?;
+    let config_url = sources.resolve(&sources.config, "config.json")?;
+    p.stage("config", &format!("downloading {config_url}"));
+    let config_bytes = super::fetch::fetch_bytes(&config_url).await.map_err(to_js)?;
     let config: VoxCpm2Config =
         serde_json::from_slice(&config_bytes).map_err(|e| err(format!("config.json: {e}")))?;
 
     // --- tokenizer.json ---------------------------------------------------
-    p.stage("tokenizer", "downloading tokenizer.json");
-    let tok_bytes = super::fetch::fetch_bytes(&format!("{base}/tokenizer.json"))
-        .await
-        .map_err(to_js)?;
+    let tokenizer_url = sources.resolve(&sources.tokenizer, "tokenizer.json")?;
+    p.stage("tokenizer", &format!("downloading {tokenizer_url}"));
+    let tok_bytes = super::fetch::fetch_bytes(&tokenizer_url).await.map_err(to_js)?;
     let tokenizer = TextTokenizer::from_bytes(&tok_bytes).map_err(to_js)?;
     drop(tok_bytes);
 
@@ -554,8 +603,8 @@ pub async fn load_model(
     let mut acc = weights::empty_apply_result();
 
     // --- model.safetensors, streamed --------------------------------------
-    let model_url = format!("{base}/model.safetensors");
-    p.stage("weights", "reading safetensors header");
+    let model_url = sources.resolve(&sources.model, "model.safetensors")?;
+    p.stage("weights", &format!("reading header of {model_url}"));
     let src = HttpRangeSource::open(&model_url).await.map_err(to_js)?;
     let checkpoint = Checkpoint::open(&src).await.map_err(to_js)?;
     let r = stream::stream_into::<WebBackend, _, _, _>(
@@ -574,17 +623,36 @@ pub async fn load_model(
     // --- audiovae.safetensors --------------------------------------------
     // Small enough (359 MB) to hold whole, and its weight_norm pairs want
     // to be grouped anyway.
-    let vae_url = format!("{base}/audiovae.safetensors");
-    p.stage("audiovae", "downloading audiovae.safetensors");
-    let vae_bytes = super::fetch::fetch_bytes(&vae_url).await.map_err(|e| {
-        err(format!(
-            "{e}\n\nUpstream ships `audiovae.pth` (a Python pickle), which this \
-             build cannot read. Convert it once:\n    \
-             cargo run --release --example convert_audiovae \\\n    \
-             --no-default-features --features cpu -- <checkpoint-dir>"
-        ))
-    })?;
-    let vae_src = MemorySource::new(&vae_url, vae_bytes);
+    let (vae_label, vae_bytes) = match audiovae_bytes {
+        Some(arr) => {
+            // Supplied by the page — a local file, or a cache hit.
+            p.stage("audiovae", "reading AudioVAE supplied by the page");
+            let bytes = arr.to_vec();
+            if bytes.is_empty() {
+                return Err(err("audiovae_bytes is empty"));
+            }
+            ("audiovae (from page)".to_string(), bytes)
+        }
+        None => {
+            let vae_url = sources.resolve(&sources.audiovae, "audiovae.safetensors")?;
+            p.stage("audiovae", &format!("downloading {vae_url}"));
+            let bytes = super::fetch::fetch_bytes(&vae_url).await.map_err(|e| {
+                err(format!(
+                    "{e}\n\nNo `audiovae.safetensors` at that URL. Upstream publishes \
+                     only `audiovae.pth`, a Python pickle this build cannot read, and no \
+                     safetensors version of it is hosted anywhere public.\n\n\
+                     Convert it once:\n    \
+                     cargo run --release --example convert_audiovae \\\n    \
+                     --no-default-features --features cpu -- <checkpoint-dir>\n\n\
+                     Then either host the result somewhere that sends CORS headers (a \
+                     Hugging Face repo works; GitHub release assets do not), or just \
+                     select the file in the page."
+                ))
+            })?;
+            (vae_url, bytes)
+        }
+    };
+    let vae_src = MemorySource::new(&vae_label, vae_bytes);
     let vae_checkpoint = Checkpoint::open(&vae_src).await.map_err(to_js)?;
     let r = stream::stream_into::<WebBackend, _, _, _>(
         &mut model,
