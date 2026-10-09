@@ -302,6 +302,11 @@ async function boot() {
     wasm = chosen.exports;
     vox.init('info');
     say(`loaded the ${chosen.precision.toUpperCase()} bundle from ${chosen.dir}.`);
+    // Only now is `vox` callable. The button starts disabled because the
+    // boot path runs two probes and fetches ~11 MB of wasm first, and a
+    // click in that window used to land on a null and report
+    // "Cannot read properties of null (reading 'webgpu_self_test')".
+    els.selftest.disabled = false;
     // Rust cannot see who the adapter is on the WebGPU backend; tell it.
     if (gpu) {
       vox.set_adapter_hint(
@@ -384,14 +389,24 @@ els.stream.addEventListener('change', () => {
 });
 
 els.allowSoftware.addEventListener('change', () => {
-  vox.allow_software_adapter(els.allowSoftware.checked);
   if (els.allowSoftware.checked) {
     say('software WebGPU adapters allowed — inference will run on the CPU. ' +
         'Timings from this run mean nothing.');
   }
+  // The checkbox is usable before the module finishes loading; `boot()`
+  // applies whatever it is set to once `vox` exists, so doing nothing
+  // here is correct rather than merely safe.
+  if (vox) {
+    vox.allow_software_adapter(els.allowSoftware.checked);
+  }
 });
 
 els.selftest.addEventListener('click', async () => {
+  if (!vox) {
+    say('the WASM module is not loaded yet — wait for "loaded the … bundle".',
+        'error');
+    return;
+  }
   els.selftest.disabled = true;
   els.selftestOut.hidden = false;
   els.selftestOut.className = 'out';
@@ -786,6 +801,8 @@ const hasLocalModels = () => probe('/models/config.json');
 const hasSiteAudioVae = () => probe('audiovae.safetensors');
 
 (async () => {
+  say('starting up: checking what this origin serves, then loading the WASM ' +
+      'module. Buttons stay disabled until it is ready.');
   const [local, siteVae] = await Promise.all([hasLocalModels(), hasSiteAudioVae()]);
   if (siteVae) {
     siteAudioVae = 'audiovae.safetensors';
