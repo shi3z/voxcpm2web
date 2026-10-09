@@ -12,9 +12,21 @@ use symphonia::core::probe::Hint;
 use crate::{Error, Result};
 
 /// Write a 32-bit float mono waveform to a 16-bit PCM WAV file.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write_wav(path: impl AsRef<Path>, samples: &[f32], sample_rate: u32) -> Result<()> {
     let file = std::fs::File::create(path)?;
     write_wav_to(std::io::BufWriter::new(file), samples, sample_rate)
+}
+
+/// Browser stub: there is no filesystem to write to. Use [`encode_wav`] and
+/// hand the bytes to JavaScript (a `Blob` + download link, or the
+/// File System Access API) instead.
+#[cfg(target_arch = "wasm32")]
+pub fn write_wav(path: impl AsRef<Path>, _samples: &[f32], _sample_rate: u32) -> Result<()> {
+    Err(Error::Unsupported(format!(
+        "write_wav(`{}`): no filesystem on wasm32 — use `encode_wav` and save the bytes from JS",
+        path.as_ref().display()
+    )))
 }
 
 /// Write a 32-bit float mono waveform as 16-bit PCM WAV to any
@@ -54,6 +66,7 @@ pub fn encode_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
 
 /// Decode an audio file (WAV/FLAC/MP3/etc. — anything Symphonia supports) to
 /// a mono `f32` PCM waveform, returning `(samples, sample_rate)`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_audio(path: impl AsRef<Path>) -> Result<(Vec<f32>, u32)> {
     let file = std::fs::File::open(path.as_ref())?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -193,9 +206,28 @@ pub fn resample(input: &[f32], from_sr: u32, to_sr: u32) -> Result<Vec<f32>> {
 }
 
 /// Load `path`, downmix to mono, and resample to `target_sr`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_audio_as(path: impl AsRef<Path>, target_sr: u32) -> Result<Vec<f32>> {
     let (pcm, sr) = load_audio(path)?;
     resample(&pcm, sr, target_sr)
+}
+
+/// Browser stub for the path-based loader.
+///
+/// `wasm32-unknown-unknown` has no filesystem, so
+/// [`crate::PromptAudio::File`] cannot be served here. Read the file in
+/// JavaScript (`<input type="file">` → `ArrayBuffer`, or `fetch`) and pass
+/// the bytes as [`crate::PromptAudio::Encoded`], or decode it with
+/// `AudioContext.decodeAudioData` and pass [`crate::PromptAudio::Pcm`].
+/// Both routes go through code shared with the native build —
+/// [`load_audio_bytes_as`] and [`resample`] respectively.
+#[cfg(target_arch = "wasm32")]
+pub fn load_audio_as(path: impl AsRef<Path>, _target_sr: u32) -> Result<Vec<f32>> {
+    Err(Error::Unsupported(format!(
+        "PromptAudio::File(`{}`) is unavailable on wasm32 — no filesystem. \
+         Pass PromptAudio::Encoded(bytes) or PromptAudio::Pcm {{ .. }} instead",
+        path.as_ref().display()
+    )))
 }
 
 /// Decode an encoded audio byte buffer (WAV/FLAC/MP3/etc.) to mono `f32` PCM,

@@ -1,0 +1,8 @@
+# getrandom 0.3 refuses to pick a backend on wasm32-unknown-unknown unless
+# this cfg is set (the `wasm_js` Cargo feature alone is not enough). burn /
+# cubecl pull getrandom in transitively through `rand`, and `Tensor::random`
+# needs it for the diffusion sampler's noise.
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "--cfg", "getrandom_backend=\"wasm_js\"",
+]

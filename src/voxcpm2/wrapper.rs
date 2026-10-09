@@ -314,6 +314,7 @@ impl<B: Backend> VoxCPM<B> {
     /// Weight-load progress is reported through the [`log`] crate (`info` for
     /// the summary, `warn` for missing/unused tensors, `error` for load
     /// errors). Wire up `env_logger`, `tracing-log`, etc. to surface them.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_local(path: impl AsRef<Path>, device: &B::Device) -> crate::Result<Self> {
         let path = path.as_ref();
         let config_bytes = std::fs::read_to_string(path.join("config.json"))?;
@@ -321,37 +322,35 @@ impl<B: Backend> VoxCPM<B> {
         let tokenizer = TextTokenizer::from_local(path)?;
         let mut model = VoxCpm2Model::<B>::new(config, device);
         let result = crate::weights::load_pretrained(&mut model, path)?;
-        log::info!(
-            "weights loaded — applied={}, skipped={}, missing={}, unused={}, errors={}",
-            result.applied.len(),
-            result.skipped.len(),
-            result.missing.len(),
-            result.unused.len(),
-            result.errors.len(),
-        );
-        if !result.missing.is_empty() {
-            log::warn!("missing module params (first 20):");
-            for (k, ctx) in result.missing.iter().take(20) {
-                log::warn!("  {k} [{ctx}]");
-            }
-        }
-        if !result.unused.is_empty() {
-            log::warn!("unused checkpoint tensors (first 20):");
-            for k in result.unused.iter().take(20) {
-                log::warn!("  {k}");
-            }
-        }
-        if !result.errors.is_empty() {
-            log::error!("load errors (first 20):");
-            for e in result.errors.iter().take(20) {
-                log::error!("  {e:?}");
-            }
-        }
+        report_apply_result(&result);
         Ok(Self {
             model,
             tokenizer,
             device: device.clone(),
         })
+    }
+
+    /// Assemble a [`VoxCPM`] from pieces the caller has already built.
+    ///
+    /// Used by the browser loader, which must construct the model first and
+    /// then stream weights into it group-by-group (see
+    /// [`crate::weights::apply_tensor_group`]) rather than loading a whole
+    /// checkpoint file in one shot.
+    pub fn from_parts(
+        model: VoxCpm2Model<B>,
+        tokenizer: TextTokenizer,
+        device: &B::Device,
+    ) -> Self {
+        Self {
+            model,
+            tokenizer,
+            device: device.clone(),
+        }
+    }
+
+    /// The device this model's tensors live on.
+    pub fn device(&self) -> &B::Device {
+        &self.device
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -459,6 +458,47 @@ impl<B: Backend> VoxCPM<B> {
         )?;
 
         Ok(decode_latent_to_samples(&self.model.audio_vae, latent)?)
+    }
+
+    /// Async twin of [`Self::generate`] — the browser entry point.
+    ///
+    /// Same conditioning, same sampler, same output. The difference is that
+    /// the two GPU→CPU readbacks in the pipeline (the per-step stop bit and
+    /// the final waveform) are awaited rather than blocked on, because
+    /// WebGPU readback is `mapAsync` and cubecl's `block_on` cannot wait on
+    /// wasm.
+    ///
+    /// `parallel_segments` is ignored here: the batched path exists to
+    /// saturate a launch-bound discrete GPU, which is not the browser's
+    /// problem, and it would multiply peak activation memory. Set it for
+    /// native runs.
+    pub async fn generate_async(
+        &self,
+        text: &str,
+        opts: GenerateOptions,
+    ) -> crate::Result<Vec<f32>> {
+        let inputs = self.build_inference_inputs(text, &opts.prompt)?;
+
+        let cancel_fn: Option<Box<dyn Fn() -> bool>> = opts.cancel.as_ref().map(|c| {
+            let c = c.clone();
+            Box::new(move || c.is_cancelled()) as Box<dyn Fn() -> bool>
+        });
+        let (latent, _stop_steps) = self
+            .model
+            .inference_async(
+                inputs.text_token,
+                inputs.text_mask,
+                inputs.feat,
+                inputs.feat_mask,
+                opts.min_len,
+                opts.max_len,
+                opts.inference_timesteps,
+                opts.cfg_value as f64,
+                cancel_fn.as_deref(),
+            )
+            .await?;
+
+        decode_latent_to_samples_async(&self.model.audio_vae, latent).await
     }
 
     /// Streaming variant of [`Self::generate`]: returns an iterator that
@@ -1113,6 +1153,26 @@ fn decode_latent_to_samples<B: Backend>(
         .map_err(|_| crate::Error::Other("unexpected VAE output dtype".into()))
 }
 
+/// Async twin of [`decode_latent_to_samples`]: awaits the waveform
+/// readback instead of blocking on it.
+pub(crate) async fn decode_latent_to_samples_async<B: Backend>(
+    audio_vae: &crate::audiovae::AudioVae<B>,
+    latent: Tensor<B, 3>,
+) -> crate::Result<Vec<f32>> {
+    let wav = audio_vae.decode(latent);
+    let wav = wav.squeeze_dim::<2>(1); // [B, T_out]
+    let wav = wav.squeeze_dim::<1>(0); // [T_out]
+    let data = wav
+        .into_data_async()
+        .await
+        .map_err(|e| crate::Error::Other(format!("waveform readback failed: {e:?}")))?;
+    // Backend-agnostic: the VAE may produce f32, f16 or bf16 depending on
+    // the active Backend; convert to f32 for output regardless.
+    data.convert::<f32>()
+        .into_vec::<f32>()
+        .map_err(|_| crate::Error::Other("unexpected VAE output dtype".into()))
+}
+
 /// Iterator returned by [`VoxCPM::generate_stream`]. Yields `Result<Vec<f32>>`
 /// chunks of mono PCM at [`VoxCPM::sample_rate`] until generation stops.
 ///
@@ -1211,6 +1271,95 @@ impl<B: Backend> GenerateStream<'_, B> {
     }
 }
 
+impl<B: Backend> GenerateStream<'_, B> {
+    /// Async twin of the `Iterator` impl — the browser's streaming path.
+    ///
+    /// Returns the next chunk of PCM, or `None` when generation is done.
+    /// Semantics are identical to [`Iterator::next`]; the difference is
+    /// that the two GPU readbacks (the per-step stop bit and the decoded
+    /// waveform) are awaited rather than blocked on, which is the only
+    /// way they can work under WebGPU.
+    ///
+    /// ```no_run
+    /// # async fn demo() -> voxcpm_rs::Result<()> {
+    /// # use voxcpm_rs::{GenerateOptions, VoxCPM};
+    /// # type B = burn::backend::NdArray<f32>;
+    /// # let model: VoxCPM<B> = unimplemented!();
+    /// let mut stream = model.generate_stream("Hello, world!", GenerateOptions::default())?;
+    /// while let Some(chunk) = stream.next_chunk_async().await {
+    ///     let chunk = chunk?;
+    ///     // play `chunk` as soon as it arrives
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn next_chunk_async(&mut self) -> Option<crate::Result<Vec<f32>>> {
+        loop {
+            match self.step_chunk_async().await {
+                Ok(Some(chunk)) if chunk.is_empty() => {
+                    if self.finished {
+                        return None;
+                    }
+                    continue;
+                }
+                Ok(Some(chunk)) => return Some(Ok(chunk)),
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    /// Async twin of [`Self::step_chunk`]. Keep the two in step.
+    async fn step_chunk_async(&mut self) -> crate::Result<Option<Vec<f32>>> {
+        if self.finished {
+            return Ok(None);
+        }
+
+        let mut produced_any = false;
+        for _ in 0..self.chunk_patches {
+            if self.step >= self.max_len {
+                self.finished = true;
+                break;
+            }
+            if let Some(c) = &self.cancel
+                && c.is_cancelled()
+            {
+                self.finished = true;
+                return Err(crate::Error::Cancelled);
+            }
+
+            let i = self.step;
+            let crate::voxcpm2::model::DitStep { pred_feat, stops } = self
+                .model
+                .dit_step_async(&mut self.state, self.inference_timesteps, self.cfg_value)
+                .await?;
+            self.pred_feats.push(pred_feat.clone());
+            produced_any = true;
+
+            let stop = stops.first().copied().unwrap_or(false);
+            if i > self.min_len && stop {
+                self.finished = true;
+                self.step += 1;
+                break;
+            }
+            self.model.lm_step(&mut self.state, pred_feat);
+            self.step += 1;
+        }
+
+        if !produced_any {
+            return Ok(None);
+        }
+
+        let latent = crate::voxcpm2::VoxCpm2Model::stack_pred_feats(&self.pred_feats);
+        let all = decode_latent_to_samples_async(&self.model.audio_vae, latent).await?;
+        if all.len() <= self.samples_emitted {
+            return Ok(Some(Vec::new()));
+        }
+        let chunk = all[self.samples_emitted..].to_vec();
+        self.samples_emitted = all.len();
+        Ok(Some(chunk))
+    }
+}
+
 impl<B: Backend> Iterator for GenerateStream<'_, B> {
     type Item = crate::Result<Vec<f32>>;
 
@@ -1237,5 +1386,36 @@ impl<B: Backend> Iterator for GenerateStream<'_, B> {
 enum PadMode {
     Right,
     Left,
+}
+
+/// Log a weight-load summary at `info`, with the problem lists at
+/// `warn`/`error`. Shared by the native and browser loaders.
+pub fn report_apply_result(result: &burn_store::ApplyResult) {
+    log::info!(
+        "weights loaded — applied={}, skipped={}, missing={}, unused={}, errors={}",
+        result.applied.len(),
+        result.skipped.len(),
+        result.missing.len(),
+        result.unused.len(),
+        result.errors.len(),
+    );
+    if !result.missing.is_empty() {
+        log::warn!("missing module params (first 20):");
+        for (k, ctx) in result.missing.iter().take(20) {
+            log::warn!("  {k} [{ctx}]");
+        }
+    }
+    if !result.unused.is_empty() {
+        log::warn!("unused checkpoint tensors (first 20):");
+        for k in result.unused.iter().take(20) {
+            log::warn!("  {k}");
+        }
+    }
+    if !result.errors.is_empty() {
+        log::error!("load errors (first 20):");
+        for e in result.errors.iter().take(20) {
+            log::error!("  {e:?}");
+        }
+    }
 }
 

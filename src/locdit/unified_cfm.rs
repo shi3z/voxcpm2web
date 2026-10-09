@@ -45,7 +45,7 @@ impl<B: Backend> UnifiedCfm<B> {
         let [b, _] = mu.dims();
         let device = mu.device();
 
-        let z = if std::env::var("VOXCPM_Z_ZERO").is_ok() {
+        let z = if crate::compat::env_flag("VOXCPM_Z_ZERO") {
             Tensor::<B, 3>::zeros([b, self.in_channels, patch_size], &device)
         } else {
             Tensor::<B, 3>::random(

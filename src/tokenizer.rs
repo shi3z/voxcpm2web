@@ -6,6 +6,7 @@
 //! split back into single characters before being encoded to ids.
 
 use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use tokenizers::tokenizer::Tokenizer;
@@ -23,9 +24,29 @@ fn is_chinese_char(c: char) -> bool {
 }
 
 impl TextTokenizer {
+    /// Load `tokenizer.json` from a checkpoint directory on disk.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_local(dir: impl AsRef<Path>) -> Result<Self> {
         let path = dir.as_ref().join("tokenizer.json");
         let tokenizer = Tokenizer::from_file(&path).map_err(|e| Error::Tokenizer(e.to_string()))?;
+        Ok(Self::wrap(tokenizer))
+    }
+
+    /// Load a `tokenizer.json` that is already in memory.
+    ///
+    /// This is the browser entry point (the bytes come from `fetch`), and is
+    /// also handy natively for embedded or archived checkpoints. Identical
+    /// behaviour to [`Self::from_local`] — the multi-character CJK token set
+    /// is derived from the vocab the same way.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let tokenizer =
+            Tokenizer::from_bytes(bytes).map_err(|e| Error::Tokenizer(e.to_string()))?;
+        Ok(Self::wrap(tokenizer))
+    }
+
+    /// Precompute the set of multi-character CJK tokens that `encode` splits
+    /// back into single characters.
+    fn wrap(tokenizer: Tokenizer) -> Self {
         let vocab = tokenizer.get_vocab(true);
         let multichar_tokens: HashSet<String> = vocab
             .keys()
@@ -35,7 +56,7 @@ impl TextTokenizer {
             })
             .cloned()
             .collect();
-        Ok(Self { tokenizer, multichar_tokens })
+        Self { tokenizer, multichar_tokens }
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<i64>> {

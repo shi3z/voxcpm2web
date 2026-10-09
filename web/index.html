@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoxCPM2 WebGPU</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>VoxCPM2 WebGPU</h1>
+    <p class="sub">Speech synthesis entirely in the browser — WASM + WebGPU, no inference server.</p>
+  </header>
+
+  <section id="unsupported" hidden>
+    <h2>WebGPU is not available</h2>
+    <p id="unsupported-why"></p>
+  </section>
+
+  <section class="panel" id="setup">
+    <div class="row">
+      <button id="btn-selftest">1. Self-test WebGPU</button>
+      <button id="btn-load" disabled>2. Load model</button>
+    </div>
+    <label class="field">
+      <span>Model base URL</span>
+      <input id="model-url" type="text" value="/models" spellcheck="false">
+    </label>
+    <label class="check">
+      <input id="allow-software" type="checkbox">
+      <span>Allow a <strong>software</strong> WebGPU adapter (SwiftShader / llvmpipe).
+      Off by default: this is a 2.3&nbsp;B-parameter model, so a CPU rasterizer takes
+      hours and any timing it produces is meaningless. Only for correctness testing
+      where no GPU is reachable.</span>
+    </label>
+    <pre id="selftest-out" class="out" hidden></pre>
+    <div id="load-progress" hidden>
+      <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+      <div class="progress-text"><span id="progress-stage">—</span><span id="progress-pct"></span></div>
+      <div class="progress-detail" id="progress-detail"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="generate-panel">
+    <label class="field">
+      <span>Text</span>
+      <textarea id="text" rows="3">こんにちは。これはブラウザだけで生成した音声です。</textarea>
+    </label>
+
+    <details class="options">
+      <summary>Options</summary>
+      <div class="opts-grid">
+        <label class="field"><span>CFG scale</span><input id="cfg" type="number" value="2.0" step="0.1" min="0.5" max="5"></label>
+        <label class="field"><span>Diffusion steps</span><input id="timesteps" type="number" value="10" step="1" min="2" max="50"></label>
+        <label class="field"><span>Max patches</span><input id="maxlen" type="number" value="600" step="50" min="10" max="2000"></label>
+      </div>
+      <label class="check">
+        <input id="stream" type="checkbox">
+        <span>Stream audio while generating. Plays each chunk as it is produced rather
+        than waiting for the whole utterance. Lowers time-to-first-audio; raises total
+        work, because every chunk re-decodes the accumulated latent.</span>
+      </label>
+      <label class="field" id="chunk-field" hidden>
+        <span>Patches per chunk (smaller = lower latency, more redundant decode)</span>
+        <input id="chunk-patches" type="number" value="5" step="1" min="1" max="50">
+      </label>
+      <label class="check">
+        <input id="zzero" type="checkbox">
+        <span>Deterministic (<code>VOXCPM_Z_ZERO</code>): zero the diffusion sampler's noise so a run
+        can be diffed numerically against native. <strong>Degrades the audio</strong> — measured on
+        native, it drops voiced frames from ~57% to ~24% and stops the stop-head firing, so the model
+        runs to <code>max_len</code>. Use it to compare numbers, not to judge quality.</span>
+      </label>
+    </details>
+
+    <details class="options">
+      <summary>Reference voice (voice cloning)</summary>
+      <div class="row">
+        <input id="ref-file" type="file" accept="audio/*">
+        <button id="btn-record" type="button">● Record</button>
+        <button id="btn-clear-ref" type="button" disabled>Clear</button>
+      </div>
+      <p class="hint" id="ref-status">No reference — the model improvises a voice. Audio stays in this tab; nothing is uploaded.</p>
+    </details>
+
+    <div class="row">
+      <button id="btn-generate" disabled>Generate</button>
+      <button id="btn-play" disabled>▶ Play</button>
+      <button id="btn-stop" disabled>■ Stop</button>
+      <button id="btn-save" disabled>Save WAV</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Status</h2>
+    <pre id="status" class="out">idle</pre>
+  </section>
+
+  <section class="panel">
+    <h2>Metrics</h2>
+    <table class="metrics">
+      <tbody>
+        <tr><th>WebGPU adapter</th><td id="m-adapter">—</td></tr>
+        <tr><th>Weight precision</th><td id="m-precision">—</td></tr>
+        <tr><th>Model load time</th><td id="m-load">—</td></tr>
+        <tr><th>Generation time</th><td id="m-gen">—</td></tr>
+        <tr><th>Time to first audio</th><td id="m-ttfa">—</td></tr>
+        <tr><th>Chunks / underruns</th><td id="m-chunks">—</td></tr>
+        <tr><th>Audio duration</th><td id="m-dur">—</td></tr>
+        <tr><th>RTF (gen / audio)</th><td id="m-rtf">—</td></tr>
+        <tr><th>Peak amplitude</th><td id="m-peak">—</td></tr>
+        <tr><th>WASM heap</th><td id="m-heap">—</td></tr>
+        <tr><th>Est. GPU weights</th><td id="m-gpu">—</td></tr>
+      </tbody>
+    </table>
+    <p class="hint">RTF &lt; 1 means faster than realtime.</p>
+  </section>
+
+  <section class="panel">
+    <h2>Diagnostics</h2>
+    <table class="metrics" id="diag"><tbody></tbody></table>
+  </section>
+
+  <footer>
+    <p>Milestones and known limitations: <code>docs/browser-port-analysis.md</code>, <code>docs/webgpu-memory.md</code>.</p>
+  </footer>
+</main>
+<script type="module" src="main.js"></script>
+</body>
+</html>

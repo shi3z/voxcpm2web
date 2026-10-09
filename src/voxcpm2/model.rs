@@ -282,18 +282,24 @@ impl<B: Backend> VoxCpm2Model<B> {
         }
     }
 
-    /// Run one diffusion sample + stop-head check from the current state.
+    /// Run one diffusion sample + stop-head check from the current state,
+    /// **without** reading the stop bit back from the GPU.
     ///
     /// Updates `state.prefix_feat_cond` to the newly predicted patch (so the
     /// next DiT step sees it as context) but does NOT advance the LM caches —
     /// call [`Self::lm_step`] with the returned `pred_feat` to do that before
-    /// the next [`Self::dit_step`].
-    pub fn dit_step(
+    /// the next step.
+    ///
+    /// This is the half that is identical on every platform. The readback is
+    /// split out because it is the one operation that cannot block in a
+    /// browser: [`Self::dit_step`] blocks on it (native), and
+    /// [`Self::dit_step_async`] awaits it (browser).
+    pub fn dit_step_deferred(
         &self,
         state: &mut InferenceState<B>,
         inference_timesteps: usize,
         cfg_value: f64,
-    ) -> DitStep<B> {
+    ) -> DitStepDeferred<B> {
         let patch_size = self.patch_size();
 
         // DiT inputs: concat(lm_to_dit(lm), res_to_dit(res))
@@ -316,19 +322,58 @@ impl<B: Backend> VoxCpm2Model<B> {
         let pred4: Tensor<B, 4> = pred_feat.clone().unsqueeze_dim(1);
         state.prefix_feat_cond = pred_feat;
 
-        // Stop check (cheap GPU→CPU sync via argmax). One bit per batch
-        // element — for B=1 this is a 1-element vec.
+        // Stop check. One bit per batch element — for B=1 this is a
+        // 1-element readback.
         let stop_logits = self
             .stop_head
             .forward(crate::minicpm4::silu_stable(self.stop_proj.forward(state.lm_hidden.clone())));
-        let stops: Vec<bool> = stop_logits
-            .argmax(1)
-            .into_data()
-            .iter::<i64>()
-            .map(|v| v == 1)
-            .collect();
 
-        DitStep { pred_feat: pred4, stops }
+        DitStepDeferred {
+            pred_feat: pred4,
+            stop_ids: stop_logits.argmax(1),
+        }
+    }
+
+    /// Run one diffusion sample + stop-head check, blocking on the stop
+    /// readback.
+    ///
+    /// **Not usable in a browser.** The stop bit requires a GPU→CPU copy,
+    /// which under WebGPU is `mapAsync`; cubecl's `block_on` on
+    /// `target_family = "wasm"` is `poll_once` + `expect`, so this panics
+    /// with "Failed to read tensor data synchronously". Use
+    /// [`Self::dit_step_async`] there.
+    pub fn dit_step(
+        &self,
+        state: &mut InferenceState<B>,
+        inference_timesteps: usize,
+        cfg_value: f64,
+    ) -> DitStep<B> {
+        let deferred = self.dit_step_deferred(state, inference_timesteps, cfg_value);
+        let stops = decode_stop_ids(deferred.stop_ids.into_data());
+        DitStep {
+            pred_feat: deferred.pred_feat,
+            stops,
+        }
+    }
+
+    /// [`Self::dit_step`] with the stop readback awaited instead of
+    /// blocked on. This is the browser path.
+    pub async fn dit_step_async(
+        &self,
+        state: &mut InferenceState<B>,
+        inference_timesteps: usize,
+        cfg_value: f64,
+    ) -> crate::Result<DitStep<B>> {
+        let deferred = self.dit_step_deferred(state, inference_timesteps, cfg_value);
+        let data = deferred
+            .stop_ids
+            .into_data_async()
+            .await
+            .map_err(|e| crate::Error::Other(format!("stop-head readback failed: {e:?}")))?;
+        Ok(DitStep {
+            pred_feat: deferred.pred_feat,
+            stops: decode_stop_ids(data),
+        })
     }
 
     /// Advance the base + residual LMs by one position using `pred_feat`
@@ -432,9 +477,9 @@ impl<B: Backend> VoxCpm2Model<B> {
         let mut stopped = vec![false; batch];
         let mut stop_steps = vec![max_len; batch];
 
-        let profile = std::env::var("VOXCPM_PROFILE").is_ok();
-        let mut t_dit_ns: u128 = 0;
-        let mut t_lm_ns: u128 = 0;
+        let profile = crate::compat::env_flag("VOXCPM_PROFILE");
+        let mut t_dit_ms: f64 = 0.0;
+        let mut t_lm_ms: f64 = 0.0;
         let mut n_steps: usize = 0;
 
         // Helper closure: force a GPU→CPU sync by reading a tiny scalar.
@@ -452,14 +497,14 @@ impl<B: Backend> VoxCpm2Model<B> {
                 return Err(crate::Error::Cancelled);
             }
 
-            let t0 = profile.then(std::time::Instant::now);
+            let t0 = profile.then(crate::compat::Stopwatch::start);
             let DitStep { pred_feat, stops } =
                 self.dit_step(&mut state, inference_timesteps, cfg_value);
             pred_feats.push(pred_feat.clone());
             if profile {
                 sync_barrier(pred_feat.clone().squeeze_dim::<3>(1).narrow(2, 0, 1).squeeze_dim(2));
             }
-            let t1 = profile.then(std::time::Instant::now);
+            let t1 = profile.then(crate::compat::Stopwatch::start);
 
             let mut all_done = false;
             if i > min_len {
@@ -474,7 +519,7 @@ impl<B: Backend> VoxCpm2Model<B> {
 
             if all_done {
                 if let (Some(t0), Some(t1)) = (t0, t1) {
-                    t_dit_ns += t1.duration_since(t0).as_nanos();
+                    t_dit_ms += t1.since(&t0);
                     n_steps += 1;
                 }
                 break;
@@ -484,9 +529,9 @@ impl<B: Backend> VoxCpm2Model<B> {
 
             if let (Some(t0), Some(t1)) = (t0, t1) {
                 sync_barrier(state.residual_hidden.clone());
-                let t2 = std::time::Instant::now();
-                t_dit_ns += t1.duration_since(t0).as_nanos();
-                t_lm_ns += t2.duration_since(t1).as_nanos();
+                let t2 = crate::compat::Stopwatch::start();
+                t_dit_ms += t1.since(&t0);
+                t_lm_ms += t2.since(&t1);
                 n_steps += 1;
             }
         }
@@ -501,12 +546,141 @@ impl<B: Backend> VoxCpm2Model<B> {
         }
 
         if profile && n_steps > 0 {
-            let ms = |ns: u128| (ns as f64) / 1e6;
-            eprintln!(
+            log::info!(
                 "[profile] AR steps={} dit+stop={:.1}ms lm_tail={:.1}ms avg_per_step: dit+stop={:.2}ms lm={:.2}ms",
-                n_steps, ms(t_dit_ns), ms(t_lm_ns),
-                ms(t_dit_ns) / n_steps as f64,
-                ms(t_lm_ns) / n_steps as f64,
+                n_steps, t_dit_ms, t_lm_ms,
+                t_dit_ms / n_steps as f64,
+                t_lm_ms / n_steps as f64,
+            );
+        }
+
+        Ok((Self::stack_pred_feats(&pred_feats), stop_steps))
+    }
+
+    /// Async twin of [`Self::inference`] — the browser entry point.
+    ///
+    /// Identical semantics and identical arithmetic; the only difference is
+    /// that the per-step stop-head readback is awaited
+    /// ([`Self::dit_step_async`]) rather than blocked on
+    /// ([`Self::dit_step`]). That one change is why this exists as a
+    /// separate loop: under WebGPU the readback is `mapAsync`, and cubecl's
+    /// `block_on` on wasm cannot wait for it.
+    ///
+    /// The sync version is left byte-for-byte alone so the native `cpu` /
+    /// `wgpu` / `vulkan` backends keep their proven code path. If you touch
+    /// the AR loop, change both.
+    ///
+    /// `VOXCPM_PROFILE` timings here exclude the GPU sync barriers the sync
+    /// loop inserts (a barrier is itself a blocking readback), so the split
+    /// between `dit` and `lm` is indicative rather than exact — the total
+    /// is still right.
+    pub async fn inference_async(
+        &self,
+        text_token: Tensor<B, 2, burn::tensor::Int>,
+        text_mask: Tensor<B, 2>,
+        feat: Tensor<B, 4>,
+        feat_mask: Tensor<B, 2>,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        cancel: Option<&dyn Fn() -> bool>,
+    ) -> crate::Result<(Tensor<B, 3>, Vec<usize>)> {
+        self.inference_with_lengths_async(
+            text_token, text_mask, feat, feat_mask,
+            min_len, max_len, inference_timesteps, cfg_value, cancel, None,
+        )
+        .await
+    }
+
+    /// Async twin of [`Self::inference_with_lengths`]. See
+    /// [`Self::inference_async`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn inference_with_lengths_async(
+        &self,
+        text_token: Tensor<B, 2, burn::tensor::Int>,
+        text_mask: Tensor<B, 2>,
+        feat: Tensor<B, 4>,
+        feat_mask: Tensor<B, 2>,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        cancel: Option<&dyn Fn() -> bool>,
+        prefill_lengths: Option<Vec<usize>>,
+    ) -> crate::Result<(Tensor<B, 3>, Vec<usize>)> {
+        let batch = text_token.dims()[0];
+        let mut state = self.prefill_with_lengths(
+            text_token, text_mask, feat, feat_mask, max_len, prefill_lengths,
+        );
+        let mut pred_feats: Vec<Tensor<B, 4>> = Vec::new();
+        let mut stopped = vec![false; batch];
+        let mut stop_steps = vec![max_len; batch];
+
+        let profile = crate::compat::env_flag("VOXCPM_PROFILE");
+        let mut t_dit_ms: f64 = 0.0;
+        let mut t_lm_ms: f64 = 0.0;
+        let mut n_steps: usize = 0;
+
+        for i in 0..max_len {
+            if let Some(c) = cancel
+                && c()
+            {
+                return Err(crate::Error::Cancelled);
+            }
+
+            let t0 = profile.then(crate::compat::Stopwatch::start);
+            let DitStep { pred_feat, stops } = self
+                .dit_step_async(&mut state, inference_timesteps, cfg_value)
+                .await?;
+            pred_feats.push(pred_feat.clone());
+            // `dit_step_async` already awaited a readback of this step's
+            // output, so the GPU work above is complete — no extra barrier
+            // needed to make this timing meaningful.
+            let t1 = profile.then(crate::compat::Stopwatch::start);
+
+            let mut all_done = false;
+            if i > min_len {
+                for (b, &s) in stops.iter().enumerate() {
+                    if s && !stopped[b] {
+                        stopped[b] = true;
+                        stop_steps[b] = i + 1; // include the stop-firing patch
+                    }
+                }
+                all_done = stopped.iter().all(|s| *s);
+            }
+
+            if all_done {
+                if let (Some(t0), Some(t1)) = (t0, t1) {
+                    t_dit_ms += t1.since(&t0);
+                    n_steps += 1;
+                }
+                break;
+            }
+
+            self.lm_step(&mut state, pred_feat);
+
+            if let (Some(t0), Some(t1)) = (t0, t1) {
+                let t2 = crate::compat::Stopwatch::start();
+                t_dit_ms += t1.since(&t0);
+                t_lm_ms += t2.since(&t1);
+                n_steps += 1;
+            }
+        }
+
+        let produced = pred_feats.len();
+        for (b, s) in stop_steps.iter_mut().enumerate() {
+            if !stopped[b] || *s > produced {
+                *s = produced;
+            }
+        }
+
+        if profile && n_steps > 0 {
+            log::info!(
+                "[profile] AR steps={} dit+stop={:.1}ms lm_launch={:.1}ms avg_per_step: dit+stop={:.2}ms lm={:.2}ms",
+                n_steps, t_dit_ms, t_lm_ms,
+                t_dit_ms / n_steps as f64,
+                t_lm_ms / n_steps as f64,
             );
         }
 
@@ -539,6 +713,23 @@ pub struct InferenceState<B: Backend> {
     /// batched prefill and must be excluded from attention. `None` for
     /// the unbatched/serial path.
     pub key_padding_mask: Option<Tensor<B, 2, burn::tensor::Bool>>,
+}
+
+/// Output of [`VoxCpm2Model::dit_step_deferred`]: the predicted patch plus
+/// the *un-read* stop-head argmax still living on the GPU.
+#[derive(Debug)]
+pub struct DitStepDeferred<B: Backend> {
+    /// `[B, 1, P, D]` — the patch the diffusion sampler produced this step.
+    pub pred_feat: Tensor<B, 4>,
+    /// `[B, 1]` int tensor: the stop head's argmax, not yet copied to the
+    /// host. Read it with `into_data()` (native) or `into_data_async()`
+    /// (browser) and pass the result to [`decode_stop_ids`].
+    pub stop_ids: Tensor<B, 2, burn::tensor::Int>,
+}
+
+/// Turn a read-back stop-head argmax into one bool per batch element.
+pub fn decode_stop_ids(data: burn::tensor::TensorData) -> Vec<bool> {
+    data.iter::<i64>().map(|v| v == 1).collect()
 }
 
 /// Output of [`VoxCpm2Model::dit_step`].

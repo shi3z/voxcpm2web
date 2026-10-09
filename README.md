@@ -21,6 +21,7 @@ voxcpm_rs::audio::write_wav("out.wav", &wav, model.sample_rate())?;
 - [Quick start](#quick-start)
   - [Model files](#model-files)
 - [Backends & features](#backends--features)
+- [Browser: WASM + WebGPU](#browser-wasm--webgpu)
 - [API tour](#api-tour)
   - [Zero-shot synthesis](#zero-shot-synthesis)
   - [Voice cloning](#voice-cloning)
@@ -143,6 +144,8 @@ Pick exactly one backend:
 | `wgpu`         | Vulkan / Metal / DX12 | Recommended for GPUs. Fast cold start.                              |
 | `wgpu-fast`    | `wgpu` + fusion + autotune | ~5–7% faster steady-state; pays a one-time autotune cost (cached). |
 | `vulkan`       | Native Vulkan + **bf16** weights | ~2.6× faster than `wgpu` on AMD RDNA4. **Requires a patch** — see below. |
+| `webgpu`       | **Browser**, `wasm32-unknown-unknown` | WGSL via WebGPU. F32 weights. See [Browser](#browser-wasm--webgpu). |
+| `webgpu-f16`   | `webgpu` + F16 weights | Halves VRAM to 4.4 GB. Needs adapter `shader-f16`. |
 
 ```bash
 # CPU + BLAS
@@ -185,6 +188,202 @@ specific `rev = "…"` instead of `branch = "main"` for reproducible builds.
 > friction form that doesn't require maintaining renamed forks on crates.io.
 > See [`patches/README.md`](patches/README.md) for the patch contents and
 > rationale.
+
+## Browser: WASM + WebGPU
+
+VoxCPM2 runs entirely in a browser tab — WASM for the model code, WebGPU
+for every kernel. No inference server, no WebSocket backend, no CPU
+fallback. A local HTTP server only serves static files and the checkpoint.
+
+```
+text ──► WASM (voxcpm-rs) ──► WebGPU compute ──► Vec<f32> PCM
+                                                      │
+                                      Float32Array ───┴──► AudioBuffer ──► speakers
+```
+
+### Build and run
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version "$(awk '/^name = "wasm-bindgen"$/{f=1;next} f&&/^version/{gsub(/[":]/,"");print $3;exit}' Cargo.lock)"
+
+# one-time: upstream ships the AudioVAE only as a PyTorch pickle, which the
+# browser build cannot read (it would need `zip` -> `zstd-sys`, i.e. C).
+cargo run --release --example convert_audiovae \
+    --no-default-features --features cpu -- /path/to/VoxCPM2
+
+scripts/build-web.sh                 # F32 weights  (needs >=12 GB VRAM)
+scripts/build-web.sh --f16           # F16 weights  (needs >=8 GB VRAM)
+
+python3 scripts/serve.py --model /path/to/VoxCPM2
+# open http://localhost:8080
+```
+
+Then: **Self-test WebGPU** → **Load model** → **Generate**.
+
+### Opening it from another machine (tailnet / LAN)
+
+**WebGPU requires a secure context.** `http://localhost` counts as one by
+special case; `http://100.x.y.z:8080` from another machine does not, so
+`navigator.gpu` is simply `undefined` there. Binding the server to
+`0.0.0.0` gets you a page that loads and then reports no WebGPU — no
+server setting can change that. It has to be HTTPS.
+
+On a tailnet that is one flag:
+
+```bash
+python3 scripts/serve.py --model /path/to/VoxCPM2 --tailscale
+#   open this on any tailnet machine:  https://<machine>.<tailnet>.ts.net:8080/
+```
+
+That asks `tailscale cert` for a real Let's Encrypt certificate for this
+node's MagicDNS name, serves HTTPS with it, and binds **only** this
+node's Tailscale v4 and v6 addresses — so the 4.4 GB checkpoint is not
+also exposed on your LAN or any public interface. No sudo, no browser
+flags, no certificate warnings. It needs HTTPS enabled for the tailnet
+([docs](https://tailscale.com/kb/1153/enabling-https)); you already have
+it if `tailscale status --json` lists `CertDomains`.
+
+Verified from a non-localhost origin: `isSecureContext = true`,
+`navigator.gpu` available, `crossOriginIsolated = true`, self-test passes.
+Serving the same page over plain HTTP to the same client instead gives
+`isSecureContext = false` and `navigator.gpu = MISSING`, and the page now
+says exactly that and how to fix it rather than blaming your GPU.
+
+To drop the `:8080` from the URL, `tailscale serve --bg 8080` will front
+it on 443. The script does not do that for you because it changes
+persistent `tailscaled` state; it only reads a certificate.
+
+Other options:
+
+| situation | what to do |
+| --- | --- |
+| Not on a tailnet | `--tls-cert` / `--tls-key` with any cert the client trusts (e.g. `mkcert`) |
+| Just want it local | default — `http://localhost:8080` is already a secure context |
+| Can't do HTTPS at all | on the *client*, launch Chrome with `--unsafely-treat-insecure-origin-as-secure=http://HOST:8080` |
+
+The server is not the bottleneck for the 4.4 GB load: a 256 MB range came
+back at ~1.5 GB/s through Python's TLS locally, so real load time is
+whatever your link does. The checkpoint is served `immutable` with a
+long max-age, so the browser HTTP cache absorbs reloads.
+
+### The server must support HTTP Range
+
+`model.safetensors` is 4.37 GB and `wasm32` has a 4 GB address space, so
+the checkpoint is never materialized. Only its header is parsed up front;
+tensors are then fetched, converted and uploaded to the GPU a module at a
+time (`src/stream.rs`), keeping peak WASM heap near 1.3 GB at F32.
+`scripts/serve.py` answers `Range` requests; `python3 -m http.server`
+does **not**, and the loader will say so rather than trying to allocate
+4.4 GB.
+
+### Memory
+
+| | GPU (weights) | peak WASM heap |
+| --- | --- | --- |
+| F32 (`webgpu`) | 8.74 GB | ~2.0 GB |
+| F16 (`webgpu-f16`) | 4.37 GB | ~1.1 GB |
+
+Full breakdown, measurements and the quantization plan:
+[`docs/webgpu-memory.md`](docs/webgpu-memory.md).
+
+### It will not silently run on the CPU
+
+Chrome hands out a SwiftShader (software) adapter when it cannot reach
+the GPU. For a 2.3 B-parameter model that means hours per utterance, so
+the demo refuses it by default and tells you what to fix — on Linux,
+usually that your user is not in the `render`/`video` groups. Tick
+*Allow a software WebGPU adapter* to override, for correctness testing
+only.
+
+### Testing the browser path without a browser
+
+`src/stream.rs` is platform-independent and sits behind a `ByteSource`
+trait, so the same loader runs over a local file:
+
+```bash
+# streams the checkpoint, then generates through `generate_async` —
+# the exact code path the browser uses
+cargo run --release --example stream_load \
+    --no-default-features --features wgpu -- \
+    /path/to/VoxCPM2 "こんにちは。" /tmp/out.wav --async
+```
+
+It reports true peak heap (via a tracking allocator, not RSS) and is a
+good deal easier to debug than a tab.
+
+### Status
+
+Verified in headless Chrome 154: self-test, model load
+(`applied=632, missing=0, errors=0`, 35.7 s) and generation all pass.
+With the sampler made deterministic on both sides, browser output matches
+a native RTX 4090 run at **correlation 1.000000**, max difference 0.04 %
+of peak — i.e. identical to f32 rounding.
+
+Those browser runs used Chrome's SwiftShader (CPU) adapter, because the
+test machine's browser could not reach its GPU. That validates
+correctness completely and says nothing about speed; the RTF figures
+quoted here are all from native runs on the same code paths. See
+`docs/browser-port-analysis.md` §4c.
+
+### Checking the browser against native
+
+Browser and native output are not bit-identical — the flow-matching
+sampler draws Gaussian noise, and WGSL reduction order differs between
+implementations. To compare them properly, zero the noise on both sides:
+
+```bash
+# native reference
+VOXCPM_Z_ZERO=1 VOXCPM_DUMP_F32=1 cargo run --release --example stream_load \
+    --no-default-features --features wgpu -- \
+    /path/to/VoxCPM2 "こんにちは。" /tmp/native.wav --async --max-len 3
+
+# browser: tick "Deterministic", Generate, then grab window.__voxPcm
+python3 scripts/compare_pcm.py /tmp/native.wav.f32 /tmp/browser.f32
+```
+
+`VOXCPM_Z_ZERO` degrades the audio (it removes part of the sampler), so
+judge *agreement* with it on, and quality with it off.
+
+### Porting notes
+
+- [`docs/browser-port-analysis.md`](docs/browser-port-analysis.md) — the
+  architecture survey, every blocker found, and what was done about each.
+- [`docs/webgpu-memory.md`](docs/webgpu-memory.md) — measured memory and
+  the F16 / INT8 / INT4 plan.
+- [`patches/README.md`](patches/README.md) — includes the
+  `cubek-reduce` workgroup fix, without which the model cannot run on any
+  WebGPU adapter at the spec-baseline limits.
+
+### Streaming playback
+
+Tick *Stream audio while generating* to play each chunk as it is
+produced. This is real incremental decoding — the model runs
+`chunk_patches` autoregressive steps, decodes, and emits — not a finished
+waveform cut into pieces. Chunk boundaries are seamless because the
+AudioVAE decoder is causal.
+
+Measured natively on an RTX 4090 (F32, `--stream`, 7.5 s utterance):
+first audio at **14.5 s**, then a chunk every 10–18 s. The per-chunk time
+grows because each chunk re-decodes the whole accumulated latent —
+`O(N^2)` across an utterance. That is the simple, correct version;
+porting Python's stateful `StreamingVAEDecoder` would make it linear.
+
+The UI reports time-to-first-audio and counts buffer underruns (chunks
+that arrived after their playback slot), which is the honest measure of
+whether a given machine is keeping up.
+
+### Not yet done
+
+- **Local checkpoint caching.** A page reload re-downloads the model,
+  modulo the HTTP cache. Cache Storage or OPFS keyed on a manifest hash
+  would fix it; the loader already goes through `ByteSource`, so a
+  cache-backed source drops in beside `HttpRangeSource`.
+- **Quantization.** F16 is wired as a build flag; INT8 / INT4 are
+  designed but not implemented. See `docs/webgpu-memory.md` §5.
+- **Linear-time streaming decode** (see above).
+
+---
 
 ## API tour
 

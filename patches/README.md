@@ -83,3 +83,54 @@ VK_DRIVER_FILES=/tmp/mesa-install/share/vulkan/icd.d/radeon_icd.x86_64.json carg
 ```
 
 Tested against Mesa 25.2.8.
+
+---
+
+## `cubek-reduce-workgroup-clamp.patch` (cubek-reduce 0.1.1)
+
+**Needed for: the browser / WebGPU build.** Harmless elsewhere.
+
+`cubek-reduce`'s three launch routines (`routines/{unit,plane,cube}.rs`)
+build their workgroup shape by hand:
+
+```rust
+let plane_count = calculate_plane_count_per_cube(working_units, plane_size, ..);
+let cube_dim = CubeDim::new_2d(plane_size, plane_count);
+```
+
+and never clamp the product against `max_units_per_cube`. cubecl's own
+`CubeDim::new` does exactly that clamp, with the comment *"Make sure it
+respects the max units per cube (especially on wasm)"* — the hand-rolled
+path just misses it.
+
+That matters on WebGPU specifically. WebGPU exposes no subgroup size, so
+`cubecl-wgpu::create_server` substitutes `plane_size_max = 128`:
+
+```rust
+if adapter_limits.min_subgroup_size == 0 && adapter_limits.max_subgroup_size == 0 {
+    adapter_limits.min_subgroup_size = 8;
+    adapter_limits.max_subgroup_size = 128;
+}
+```
+
+With `plane_count = 4` the routines then request a 512-invocation
+workgroup. WebGPU's baseline `maxComputeInvocationsPerWorkgroup` is
+**256**, so any adapter at the baseline rejects the pipeline outright:
+
+```
+The total number of workgroup invocations (512) exceeds the maximum allowed (256).
+[Invalid ComputePipeline "reduce_kernel"] is invalid due to a previous error.
+```
+
+Every RMSNorm and every `argmax` in VoxCPM2 goes through a reduce, so the
+model cannot run at all on such a device. Discrete GPUs report 1024 and
+are unaffected, which is why this only shows up on software adapters and
+low-end hardware — and why it is easy to miss when testing on a
+workstation.
+
+The patch adds a `clamp_plane_count` helper and applies it at the three
+sites. Only `cube_dim.y` is reduced: `plane.rs` and `cube.rs` both assert
+`cube_dim.x == plane_size_max`, so `x` has to stay put.
+
+Verified against SwiftShader (which reports the 256 baseline), where the
+reduce pipelines go from invalid to valid.

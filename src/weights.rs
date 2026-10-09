@@ -15,18 +15,68 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 use burn::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
 use burn::tensor::TensorData;
-use burn_store::{
-    ApplyResult, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore, SafetensorsStoreError,
-};
+use burn::module::ParamId;
+use burn::tensor::DType;
+use burn_store::{ApplyResult, ModuleSnapshot, PyTorchToBurnAdapter, TensorSnapshot};
 use half::{bf16, f16};
+#[cfg(not(target_arch = "wasm32"))]
 use memmap2::Mmap;
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
+#[cfg(not(target_arch = "wasm32"))]
+use safetensors::SafeTensors;
 
 use crate::{Error, Result};
+
+/// A tensor as it comes off a checkpoint: `(name, shape, dtype, raw bytes)`.
+///
+/// This is the unit the browser loader streams in — see
+/// [`apply_tensor_group`]. Names are *bare* checkpoint keys (no prefix, not
+/// yet remapped); [`apply_tensor_group`] does the remapping, the
+/// `weight_norm` materialisation, the q/k/v + gate/up fusion and the dtype
+/// conversion to the backend's native float type.
+pub type RawTensor = (String, Vec<usize>, Dtype, Vec<u8>);
+
+/// Which checkpoint file a group of tensors came from. Selects the key
+/// remapping that [`apply_tensor_group`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace {
+    /// `model.safetensors` — keys already match [`crate::VoxCpm2Model`].
+    Model,
+    /// `audiovae.{safetensors,pth}` — keys follow `nn.Sequential` indexing
+    /// and live under their own top-level namespace; they get remapped by
+    /// `remap_audiovae_key` and prefixed with `audio_vae.`.
+    AudioVae,
+}
+
+impl Namespace {
+    fn prefix(self) -> Option<&'static str> {
+        match self {
+            Namespace::Model => None,
+            Namespace::AudioVae => Some("audio_vae."),
+        }
+    }
+
+    fn remap(self) -> Option<fn(&str) -> Option<String>> {
+        match self {
+            Namespace::Model => None,
+            Namespace::AudioVae => Some(remap_audiovae_key),
+        }
+    }
+}
+
+/// The safetensors dtype the active backend wants its float weights in.
+///
+/// Exposed so the browser loader can report the real on-GPU precision (and
+/// hence the real memory cost) before it starts downloading.
+pub fn backend_float_dtype<B: Backend>() -> Dtype {
+    target_float_dtype::<B>()
+}
 
 /// Pick a safetensors dtype to *write* such that burn-store can hand the
 /// bytes to the target backend tensors with no mismatch. burn-store does
@@ -53,6 +103,7 @@ fn target_float_dtype<B: Backend>() -> Dtype {
 /// - `audiovae.safetensors` **or** `audiovae.pth` — AudioVAE weights.
 ///   (The HF repo currently ships `audiovae.pth`; `.safetensors` is preferred
 ///   when both are present.)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     snapshot_dir: impl AsRef<Path>,
@@ -121,13 +172,7 @@ pub fn load_pretrained<B: Backend, M: ModuleSnapshot<B>>(
     // `audiovae.safetensors`, each file legitimately omits the other half
     // of the model. Dedupe `missing` against the union of `applied` so
     // the final report shows only params that were truly never loaded.
-    let applied_set: std::collections::HashSet<&str> =
-        result.applied.iter().map(|s| s.as_str()).collect();
-    result.missing.retain(|(path, _)| !applied_set.contains(path.as_str()));
-    // While we're at it, dedupe the missing list itself (a param may be
-    // reported missing by every file).
-    let mut seen = std::collections::HashSet::new();
-    result.missing.retain(|(path, _)| seen.insert(path.clone()));
+    finalize_apply_result(&mut result);
 
     Ok(result)
 }
@@ -260,7 +305,20 @@ fn res_unit_inner(prefix: &str, inner: usize, rest: &str) -> Option<String> {
     }
 }
 
-fn merge_apply_result(dst: &mut ApplyResult, src: ApplyResult) {
+/// An empty [`ApplyResult`] to accumulate into. Useful when driving
+/// [`apply_tensor_group`] over many groups (the browser streaming loader).
+pub fn empty_apply_result() -> ApplyResult {
+    ApplyResult {
+        applied: Vec::new(),
+        skipped: Vec::new(),
+        missing: Vec::new(),
+        unused: Vec::new(),
+        errors: Vec::new(),
+    }
+}
+
+/// Fold one group's [`ApplyResult`] into a running total.
+pub fn merge_apply_result(dst: &mut ApplyResult, src: ApplyResult) {
     dst.applied.extend(src.applied);
     dst.missing.extend(src.missing);
     dst.unused.extend(src.unused);
@@ -268,6 +326,22 @@ fn merge_apply_result(dst: &mut ApplyResult, src: ApplyResult) {
     dst.skipped.extend(src.skipped);
 }
 
+/// Collapse the per-group `missing` noise out of an accumulated
+/// [`ApplyResult`].
+///
+/// burn-store reports `missing` relative to the *store it was handed*, so
+/// every group legitimately reports every parameter it does not itself
+/// carry. After all groups have been applied, a parameter is only truly
+/// missing if no group ever supplied it.
+pub fn finalize_apply_result(result: &mut ApplyResult) {
+    let applied_set: std::collections::HashSet<&str> =
+        result.applied.iter().map(|s| s.as_str()).collect();
+    result.missing.retain(|(path, _)| !applied_set.contains(path.as_str()));
+    let mut seen = std::collections::HashSet::new();
+    result.missing.retain(|(path, _)| seen.insert(path.clone()));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     path: &Path,
@@ -275,9 +349,8 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
-    use std::time::Instant;
     // Read, materialize weight_norm, re-serialize, then hand to burn-store.
-    let t0 = Instant::now();
+    let t0 = crate::compat::Stopwatch::start();
     let file = std::fs::File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
     let st = SafeTensors::deserialize(&mmap)?;
@@ -296,7 +369,7 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
             ))
         })
         .collect::<Result<_>>()?;
-    log::debug!("weights[{}] mmap+parse: {:.2?}", path.display(), t0.elapsed());
+    log::debug!("weights[{}] mmap+parse: {:.2}ms", path.display(), t0.elapsed_ms());
     drop(st);
     drop(mmap);
     repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
@@ -310,6 +383,7 @@ fn load_single<B: Backend, M: ModuleSnapshot<B>>(
 /// repo publishes only `.pth` files (e.g. `audiovae.pth` in
 /// [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2)), so no manual
 /// pth→safetensors conversion step is required on the user's side.
+#[cfg(not(target_arch = "wasm32"))]
 fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     path: &Path,
@@ -318,9 +392,8 @@ fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
     target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
     use burn_store::pytorch::PytorchReader;
-    use std::time::Instant;
 
-    let t0 = Instant::now();
+    let t0 = crate::compat::Stopwatch::start();
     let reader = PytorchReader::new(path)
         .map_err(|e| Error::Other(format!("read pytorch file `{}`: {e}", path.display())))?;
     let mut tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::with_capacity(reader.len());
@@ -336,14 +409,15 @@ fn load_single_pth<B: Backend, M: ModuleSnapshot<B>>(
         tensors.push((bare.to_string(), td.shape.clone(), dtype, td.as_bytes().to_vec()));
     }
     log::debug!(
-        "weights[{}] read-pth: {:.2?} ({} tensors)",
+        "weights[{}] read-pth: {:.2}ms ({} tensors)",
         path.display(),
-        t0.elapsed(),
+        t0.elapsed_ms(),
         tensors.len()
     );
     repack_and_apply(model, path, tensors, prefix, remap, target_float_dtype)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {    use burn::tensor::DType as B;
     Ok(match dt {
         B::F64 => Dtype::F64,
@@ -367,41 +441,151 @@ fn burn_dtype_to_safetensors(dt: burn::tensor::DType) -> Result<Dtype> {    use 
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn repack_and_apply<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     path: &Path,
-    tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)>,
+    tensors: Vec<RawTensor>,
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
 ) -> Result<ApplyResult> {
-    use std::time::Instant;
-    let t1 = Instant::now();
-    let synth_bytes = materialize_weight_norm(tensors, prefix, remap, target_float_dtype)?;
-    log::debug!(
-        "weights[{}] materialize+repack: {:.2?} ({} MB)",
-        path.display(),
-        t1.elapsed(),
-        synth_bytes.len() / (1024 * 1024)
-    );
-
-    let t2 = Instant::now();
-    let mut store = SafetensorsStore::from_bytes(Some(synth_bytes))
-        .with_from_adapter(PyTorchToBurnAdapter)
-        .allow_partial(true);
-    let r = model.load_from(&mut store).map_err(map_store_err);
-    log::debug!("weights[{}] burn-store apply: {:.2?}", path.display(), t2.elapsed());
-    r
+    apply_group_inner(
+        model,
+        &path.display().to_string(),
+        tensors,
+        prefix,
+        remap,
+        target_float_dtype,
+    )
 }
 
-fn map_store_err(e: SafetensorsStoreError) -> Error {
-    Error::Other(format!("safetensors store: {e}"))
+/// Apply one group of raw checkpoint tensors to `model`, in place.
+///
+/// This is the single entry point both loaders share. It is the whole
+/// weight pipeline for a *subset* of the checkpoint:
+///
+/// 1. materialise `weight_norm` pairs (`weight_g`/`weight_v` → `weight`),
+/// 2. remap keys and add the namespace prefix,
+/// 3. convert every float tensor to the backend's native dtype,
+/// 4. fuse `q/k/v` → `qkv_proj` and `gate/up` → `gate_up_proj`,
+/// 5. re-serialise as a small in-memory safetensors buffer, and
+/// 6. hand it to burn-store with `allow_partial(true)`.
+///
+/// Because step 6 allows partial application, it is safe to call this
+/// repeatedly with disjoint groups — which is exactly how the browser
+/// loader keeps peak WASM heap bounded while streaming a 4.4 GB
+/// checkpoint onto the GPU. See [`crate::browser`].
+///
+/// **Grouping constraint.** Steps 1 and 4 are *intra-group*: a group must
+/// contain all of `q_proj`/`k_proj`/`v_proj` together, all of
+/// `gate_proj`/`up_proj` together, and both halves of every `weight_norm`
+/// pair. Grouping per transformer layer (or per top-level module)
+/// satisfies this; splitting a layer across groups does not.
+pub fn apply_tensor_group<B: Backend, M: ModuleSnapshot<B>>(
+    model: &mut M,
+    label: &str,
+    tensors: Vec<RawTensor>,
+    namespace: Namespace,
+) -> Result<ApplyResult> {
+    apply_group_inner(
+        model,
+        label,
+        tensors,
+        namespace.prefix(),
+        namespace.remap(),
+        target_float_dtype::<B>(),
+    )
+}
+
+fn apply_group_inner<B: Backend, M: ModuleSnapshot<B>>(
+    model: &mut M,
+    label: &str,
+    tensors: Vec<RawTensor>,
+    prefix: Option<&str>,
+    remap: Option<fn(&str) -> Option<String>>,
+    target_float_dtype: Dtype,
+) -> Result<ApplyResult> {
+    let t1 = crate::compat::Stopwatch::start();
+    let prepared = prepare_group(tensors, prefix, remap, target_float_dtype)?;
+    let bytes: usize = prepared.values().map(|(_, _, d)| d.len()).sum();
+    log::debug!(
+        "weights[{}] materialize+convert: {:.2}ms ({} MB)",
+        label,
+        t1.elapsed_ms(),
+        bytes / (1024 * 1024)
+    );
+
+    // Hand burn-store `TensorSnapshot`s directly rather than serializing a
+    // safetensors buffer for it to parse back. Two reasons:
+    //
+    // 1. It drops a full copy of every tensor. `safetensors::serialize`
+    //    concatenates into a fresh buffer, which burn-store then re-reads —
+    //    so the old path peaked at 2x the converted group.
+    // 2. It avoids a hard 32-bit limit. `safetensors` 0.7 (what burn-store
+    //    depends on) validates tensors by computing `n_elements *
+    //    dtype.bitsize()` in `usize`. On `wasm32` that caps a single tensor
+    //    at 512 MiB, and VoxCPM2's token embedding is 73448 x 2048, i.e.
+    //    602 MiB at F32 — it fails with "overflow computing buffer size
+    //    from shape and/or element type".
+    //
+    // `Applier` substitutes the *module's* container stack before invoking
+    // the adapter, so the snapshots need no container information of their
+    // own for `PyTorchToBurnAdapter`'s `[out, in]` -> `[in, out]`
+    // transposition to still happen.
+    let t2 = crate::compat::Stopwatch::start();
+    let mut snapshots: Vec<TensorSnapshot> = Vec::with_capacity(prepared.len());
+    for (name, (dtype, shape, data)) in prepared {
+        let dtype = safetensors_dtype_to_burn(dtype, &name)?;
+        let data = burn::tensor::TensorData::from_bytes_vec(data, shape, dtype);
+        snapshots.push(TensorSnapshot::from_data(
+            data,
+            name.split('.').map(str::to_string).collect(),
+            Vec::new(),
+            ParamId::new(),
+        ));
+    }
+
+    let result = model.apply(
+        snapshots,
+        None,
+        Some(Box::new(PyTorchToBurnAdapter)),
+        // Matches `SafetensorsStore`'s default, which this replaced.
+        false,
+    );
+    log::debug!("weights[{}] apply: {:.2}ms", label, t2.elapsed_ms());
+    Ok(result)
+}
+
+/// Map a safetensors dtype onto burn's.
+fn safetensors_dtype_to_burn(dt: Dtype, name: &str) -> Result<DType> {
+    Ok(match dt {
+        Dtype::F64 => DType::F64,
+        Dtype::F32 => DType::F32,
+        Dtype::F16 => DType::F16,
+        Dtype::BF16 => DType::BF16,
+        Dtype::I64 => DType::I64,
+        Dtype::I32 => DType::I32,
+        Dtype::I16 => DType::I16,
+        Dtype::I8 => DType::I8,
+        Dtype::U64 => DType::U64,
+        Dtype::U32 => DType::U32,
+        Dtype::U16 => DType::U16,
+        Dtype::U8 => DType::U8,
+        Dtype::BOOL => DType::Bool,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "safetensors dtype {other:?} (tensor `{name}`) has no burn equivalent"
+            )));
+        }
+    })
 }
 
 /// Strip a common top-level container prefix that HF-published PyTorch
 /// checkpoints often use (e.g. `state_dict.`, `model.`, `model_state_dict.`)
 /// so the downstream name→module remapping can operate on bare keys.
 /// No-op if no known prefix matches.
+#[cfg(not(target_arch = "wasm32"))]
 fn strip_pth_top_level(name: &str) -> &str {
     for prefix in ["state_dict.", "model_state_dict.", "module."] {
         if let Some(rest) = name.strip_prefix(prefix) {
@@ -411,19 +595,19 @@ fn strip_pth_top_level(name: &str) -> &str {
     name
 }
 
-/// Read a safetensors file, expanding `weight_norm` parameter pairs
-/// (`X.weight_g` + `X.weight_v`) into their materialized `X.weight`. All
-/// other tensors are passed through unchanged. If `prefix` is provided, it
-/// is prepended to every key in the output. Returns a fresh serialized
-/// safetensors buffer.
-fn materialize_weight_norm(
-    tensors: Vec<(String, Vec<usize>, Dtype, Vec<u8>)>,
+/// Turn a group of raw checkpoint tensors into the exact set of named
+/// tensors the module wants, in the backend's float dtype.
+///
+/// Does, in order: expand `weight_norm` pairs (`X.weight_g` + `X.weight_v`
+/// → `X.weight`), remap and prefix keys, convert float dtypes, and fuse
+/// `q/k/v` → `qkv_proj` and `gate/up` → `gate_up_proj`. Everything else
+/// passes through unchanged.
+fn prepare_group(
+    tensors: Vec<RawTensor>,
     prefix: Option<&str>,
     remap: Option<fn(&str) -> Option<String>>,
     target_float_dtype: Dtype,
-) -> Result<Vec<u8>> {
-    use safetensors::serialize;
-
+) -> Result<HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>> {
     let mut weight_g: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
     let mut weight_v: HashMap<String, (Vec<usize>, Vec<f32>)> = HashMap::new();
     let mut plain: Vec<(String, Vec<usize>, Dtype, Vec<u8>)> = Vec::new();
@@ -521,17 +705,7 @@ fn materialize_weight_norm(
     fuse_qkv(&mut out)?;
     fuse_gate_up(&mut out)?;
 
-    let views: Vec<(String, safetensors::tensor::TensorView<'_>)> = out
-        .iter()
-        .map(|(k, (dtype, shape, data))| {
-            let tv = safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
-                .map_err(|e| Error::Other(format!("compose safetensors view `{k}`: {e}")))?;
-            Ok::<_, Error>((k.clone(), tv))
-        })
-        .collect::<std::result::Result<_, _>>()?;
-    let bytes = serialize(views.iter().map(|(k, v)| (k.clone(), v)), &None)
-        .map_err(|e| Error::Other(format!("serialize synthesized safetensors: {e}")))?;
-    Ok(bytes)
+    Ok(out)
 }
 
 fn decode_f32(dtype: Dtype, data: &[u8]) -> Result<Vec<f32>> {
@@ -562,22 +736,57 @@ fn f32_to_le_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Byte width of a float safetensors dtype.
+///
+/// `Dtype::size()` exists upstream but is not `const` across versions, and
+/// this keeps the three float cases we support explicit.
+pub fn float_dtype_size(dt: Dtype) -> usize {
+    match dt {
+        Dtype::F32 => 4,
+        Dtype::F16 | Dtype::BF16 => 2,
+        other => panic!("float_dtype_size: not a supported float dtype: {other:?}"),
+    }
+}
+
+/// Number of bytes `convert_float_slice` will write when converting
+/// `src_len` bytes of `src` into `dst`.
+pub fn converted_len(src: Dtype, dst: Dtype, src_len: usize) -> usize {
+    (src_len / float_dtype_size(src)) * float_dtype_size(dst)
+}
+
 /// Single-pass float dtype conversion that writes directly into a fresh
 /// `Vec<u8>` of the target size. Avoids the intermediate `Vec<f32>` that
 /// `decode_f32` + `encode_float` would allocate (~2× peak memory of the
 /// destination, multi-GB for the main model).
 fn convert_float_bytes(src: Dtype, dst: Dtype, data: &[u8]) -> Vec<u8> {
-    let n_elems = match src {
-        Dtype::F32 => data.len() / 4,
-        Dtype::F16 | Dtype::BF16 => data.len() / 2,
-        _ => unreachable!("convert_float_bytes called with non-float src dtype"),
-    };
-    let elem_size = match dst {
-        Dtype::F32 => 4,
-        Dtype::F16 | Dtype::BF16 => 2,
-        _ => unreachable!("convert_float_bytes called with non-float dst dtype"),
-    };
-    let mut out = vec![0u8; n_elems * elem_size];
+    let mut out = vec![0u8; converted_len(src, dst, data.len())];
+    convert_float_slice(src, dst, data, &mut out);
+    out
+}
+
+/// Convert float bytes from `src` dtype to `dst` dtype, writing into a
+/// caller-provided buffer.
+///
+/// Letting the caller own the destination is what allows the browser loader
+/// to convert a 300 MB tensor *straight into* the safetensors buffer it is
+/// about to hand burn-store, instead of building the converted tensor and
+/// then copying it again. On `wasm32` — 4 GB of address space total — that
+/// saved copy is the difference between loading the token embedding and
+/// aborting on it.
+///
+/// `out` must be exactly [`converted_len`] bytes long.
+pub fn convert_float_slice(src: Dtype, dst: Dtype, data: &[u8], out: &mut [u8]) {
+    let expected = converted_len(src, dst, data.len());
+    assert_eq!(
+        out.len(),
+        expected,
+        "convert_float_slice: destination is {} bytes, need {expected}",
+        out.len()
+    );
+    if src == dst {
+        out.copy_from_slice(data);
+        return;
+    }
 
     macro_rules! pump {
         ($read:expr, $write:expr, $src_step:expr, $dst_step:expr) => {{
@@ -607,9 +816,8 @@ fn convert_float_bytes(src: Dtype, dst: Dtype, data: &[u8]) -> Vec<u8> {
         (Dtype::F16, Dtype::BF16) => pump!(read_f16, write_bf16, 2, 2),
         (Dtype::BF16, Dtype::F32) => pump!(read_bf16, write_f32, 2, 4),
         (Dtype::BF16, Dtype::F16) => pump!(read_bf16, write_f16, 2, 2),
-        _ => unreachable!("same-dtype conversion should have been short-circuited"),
+        (a, b) => panic!("convert_float_slice: unsupported conversion {a:?} -> {b:?}"),
     }
-    out
 }
 
 /// Encode a slice of f32 values into the byte layout for a given safetensors\n/// float dtype. Used to materialise weights in the backend's native dtype\n/// because burn-store does not auto-cast across dtypes on load.
@@ -776,12 +984,14 @@ fn fuse_gate_up(
 // ---------------------------------------------------------------------------
 
 /// A memory-mapped safetensors file useful for ad-hoc tensor inspection.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub struct SafetensorsFile {
     _mmap: Mmap,
     view: *const SafeTensors<'static>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl SafetensorsFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref())?;
@@ -832,6 +1042,7 @@ impl SafetensorsFile {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for SafetensorsFile {
     fn drop(&mut self) {
         unsafe {

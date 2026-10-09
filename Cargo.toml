@@ -20,6 +20,11 @@ exclude = [
     "*.wav",
 ]
 
+[lib]
+# `cdylib` is what wasm-bindgen consumes for the browser build; `rlib` keeps
+# the crate usable as a normal Rust dependency and lets the examples link.
+crate-type = ["cdylib", "rlib"]
+
 [features]
 default = ["cpu"]
 # Vulkan / WGPU backend (primary target: AMD + NVIDIA via wgpu).
@@ -38,6 +43,20 @@ vulkan = ["burn/wgpu", "burn/vulkan"]
 # Tip: set `CUBECL_AUTOTUNE_LEVEL=minimal` at runtime to shrink the
 # cold-start cost (uses a cheap heuristic instead of measuring).
 wgpu-fast = ["wgpu", "burn/fusion", "burn/autotune"]
+# Browser target: WASM32 + WebGPU. Isolated from the native backends — it
+# routes through the same `burn/wgpu` (cubecl WGSL) path, but the crate's
+# filesystem / mmap / blocking-IO entry points are compiled out and replaced
+# by the `browser` module's fetch-based loaders. Build with:
+#   cargo build --target wasm32-unknown-unknown --release \
+#       --no-default-features --features webgpu
+webgpu = ["burn/wgpu"]
+# Browser precision switch. Weight residency on the GPU for this checkpoint:
+#   F32 -> 8.74 GB   (needs >=12 GB VRAM; matches the native `wgpu` backend
+#                     bit-for-bit, so it is the correctness reference)
+#   F16 -> 4.37 GB   (needs >=8 GB VRAM; requires the adapter to report
+#                     `shader-f16`, which cubecl enables automatically)
+# `webgpu` alone is F32. Add `webgpu-f16` to halve weight memory.
+webgpu-f16 = ["webgpu"]
 # Pure-CPU fallback using ndarray. SIMD speeds up elementwise ops; ndarray's
 # native matmul is still single-threaded — enable `cpu-blas` (compiles a
 # vendored OpenBLAS, no system deps required) for multi-core matmul.
@@ -48,13 +67,10 @@ all-backends = ["wgpu", "cpu"]
 
 [dependencies]
 burn = { version = "0.20.1", default-features = false, features = ["std"] }
-burn-store = { version = "0.20.1", default-features = false, features = ["safetensors", "pytorch", "std"] }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# HF tokenizer loader (reads tokenizer.json produced by LlamaTokenizerFast)
-tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 # Audio I/O & resampling
 hound = "3"
 symphonia = { version = "0.5", features = ["all"] }
@@ -63,7 +79,59 @@ rubato = "0.15"
 half = "2"
 log = "0.4"
 bytemuck = "1"
+
+# ---------------------------------------------------------------------------
+# Native-only dependencies
+# ---------------------------------------------------------------------------
+# `tokenizers` defaults to the `onig` regex engine, which links the C
+# oniguruma library — unavailable on wasm32-unknown-unknown. The wasm table
+# below swaps it for the pure-Rust `fancy-regex` engine via `unstable_wasm`.
+# `memmap2` compiles on wasm (it ships a stub backend) but every call fails
+# at runtime, so the mmap code paths are `cfg`-gated out of the browser build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
 memmap2 = "0.9"
+# `pytorch` reads `.pth`/`.pt` pickles. It pulls `zip`, whose default
+# compression backends include `zstd` — and `zstd-sys` is C, so it cannot
+# build for wasm32. The browser does not need it anyway: it loads
+# `audiovae.safetensors` (see scripts/convert_audiovae.py), so the wasm
+# table below drops the feature rather than vendoring a zstd build.
+burn-store = { version = "0.20.1", default-features = false, features = ["safetensors", "pytorch", "std"] }
+
+# ---------------------------------------------------------------------------
+# Browser (wasm32) dependencies
+# ---------------------------------------------------------------------------
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { version = "0.20", default-features = false, features = ["unstable_wasm"] }
+burn-store = { version = "0.20.1", default-features = false, features = ["safetensors", "std"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+# getrandom 0.3 needs the JS backend selected both by feature *and* by the
+# `getrandom_backend="wasm_js"` cfg — see `.cargo/config.toml`.
+getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = [
+    "console",
+    "Window",
+    "WorkerGlobalScope",
+    "Performance",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "RequestCache",
+    "Response",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
+    "Navigator",
+    "Gpu",
+]
 
 [dev-dependencies]
 approx = "0.5"
@@ -97,3 +165,11 @@ codegen-units = 1
 [patch.crates-io]
 burn-cubecl = { path = "vendor/patched/burn-cubecl" }
 cubecl-spirv = { path = "vendor/patched/cubecl-spirv" }
+# cubek-reduce 0.1.1: the reduce routines build their `CubeDim` by hand and
+# skip the `max_units_per_cube` clamp that `CubeDim::new` applies. On
+# WebGPU, cubecl substitutes `plane_size_max = 128` (WebGPU exposes no real
+# subgroup size), so the routines request a 512-invocation workgroup —
+# which every adapter at WebGPU's baseline
+# `maxComputeInvocationsPerWorkgroup` of 256 rejects, failing every
+# RMSNorm and argmax in the model. See `patches/cubek-reduce-workgroup-clamp.patch`.
+cubek-reduce = { path = "vendor/patched/cubek-reduce" }

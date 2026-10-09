@@ -5,3 +5,6 @@ vendor/burn/
 vendor/cubecl/
 vendor/mesa/
 vendor/nanovllm-voxcpm/
+
+# Browser build output (produced by scripts/build-web.sh)
+/web/pkg/

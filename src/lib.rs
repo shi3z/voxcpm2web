@@ -38,12 +38,16 @@
 
 pub mod audio;
 pub mod audiovae;
+#[cfg(target_arch = "wasm32")]
+pub mod browser;
+pub mod compat;
 pub mod config;
 pub mod error;
 pub mod fsq;
 pub mod locdit;
 pub mod locenc;
 pub mod minicpm4;
+pub mod stream;
 pub mod tokenizer;
 pub mod voxcpm2;
 pub mod weights;
@@ -54,6 +58,7 @@ pub use config::{
     VoxCpmDitConfig, VoxCpmEncoderConfig,
 };
 pub use error::{Error, Result};
+pub use tokenizer::TextTokenizer;
 pub use voxcpm2::{
     CancelToken, GenerateOptions, GenerateOptionsBuilder, GenerateStream, Prompt, PromptAudio,
     VoxCPM,
