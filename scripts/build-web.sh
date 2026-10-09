@@ -52,6 +52,10 @@ fi
 
 WASM="target/wasm32-unknown-unknown/$PROFILE/voxcpm_rs.wasm"
 
+# The smoke test runs the bundle under Node. Node is not needed to *build*,
+# so its absence is a loud warning rather than a hard error.
+if command -v node >/dev/null 2>&1; then CAN_CHECK=true; else CAN_CHECK=false; fi
+
 for spec in "${TARGETS[@]}"; do
   FEATURES="${spec%%:*}"
   OUT="${spec##*:}"
@@ -82,7 +86,11 @@ for spec in "${TARGETS[@]}"; do
     if wasm-opt -O2 --enable-bulk-memory --enable-nontrapping-float-to-int \
          --enable-reference-types \
          "$OUT/voxcpm_rs_bg.wasm" -o "$OUT/voxcpm_rs_bg.opt.wasm"; then
-      if node scripts/check-wasm.mjs "$OUT/voxcpm_rs_bg.opt.wasm"; then
+      if ! $CAN_CHECK; then
+        echo "!!! node not found, so the optimized module cannot be verified." >&2
+        echo "!!! Keeping the unoptimized one, which is slower to load but known good." >&2
+        rm -f "$OUT/voxcpm_rs_bg.opt.wasm"
+      elif node scripts/check-wasm.mjs "$OUT/voxcpm_rs_bg.opt.wasm"; then
         mv "$OUT/voxcpm_rs_bg.opt.wasm" "$OUT/voxcpm_rs_bg.wasm"
       else
         echo "!!! wasm-opt produced a broken module — keeping the unoptimized one." >&2
@@ -97,12 +105,18 @@ for spec in "${TARGETS[@]}"; do
     echo "==> skipping wasm-opt (not installed; optional)"
   fi
 
-  # --- always verify what we are about to ship --------------------------------
-  echo "==> smoke test"
-  node scripts/check-wasm.mjs "$OUT/voxcpm_rs_bg.wasm" || {
-    echo "error: $OUT will not work in a browser; refusing to continue" >&2
-    exit 1
-  }
+  # --- verify what we are about to ship ---------------------------------------
+  if $CAN_CHECK; then
+    echo "==> smoke test"
+    node scripts/check-wasm.mjs "$OUT/voxcpm_rs_bg.wasm" || {
+      echo "error: $OUT will not start in a browser; refusing to continue" >&2
+      exit 1
+    }
+  else
+    echo "==> NOT smoke-tested: node is not installed." >&2
+    echo "    The bundle may compile and still fail on every page load —" >&2
+    echo "    that has happened. Install Node to enable scripts/check-wasm.mjs." >&2
+  fi
 
   echo
   echo "built $OUT ($FEATURES, $PROFILE):"
