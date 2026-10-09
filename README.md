@@ -291,6 +291,27 @@ Other situations:
 | Just want it local | the default — `http://localhost:8080` is already a secure context |
 | Cannot do HTTPS at all | on the *client*, launch Chrome with `--unsafely-treat-insecure-origin-as-secure=http://HOST:8080` |
 
+A page served this way needs no configuring: it probes `/models/config.json`
+on its own origin and, finding a checkpoint there, uses it instead of
+pulling 4.4 GB from Hugging Face.
+
+### Feeding your own weights to the hosted page
+
+You can also keep the page on GitHub Pages and serve the *weights* from
+your machine — which is the easiest answer to the AudioVAE problem, since
+you already have the converted file locally:
+
+```bash
+python3 scripts/serve.py --model /path/to/VoxCPM2 --tailscale \
+    --cors https://YOU.github.io
+```
+
+`--cors` is opt-in and takes an origin. Bare `--cors` allows any origin,
+which means any site you visit could read files from that server while it
+runs, so prefer naming the one origin. The preflight matters: `Range` is
+not a CORS-safelisted header, so the browser sends `OPTIONS` first, and
+the server answers it.
+
 The page diagnoses this itself: if it loads without a secure context it
 says so, and how to fix it, rather than blaming your GPU.
 

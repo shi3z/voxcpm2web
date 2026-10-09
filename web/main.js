@@ -332,7 +332,9 @@ function applySourcePreset() {
     // Open the section, because this is the one thing the user has to do.
     $('vae-details').open = true;
     say('streaming weights from Hugging Face. The AudioVAE has no public ' +
-        'safetensors host — select your converted file below, or give a URL.');
+        'safetensors host, so it needs a source: select your converted ' +
+        'audiovae.safetensors below, or point the URL at a server that sends ' +
+        'CORS headers (scripts/serve.py --cors).');
   }
 }
 
@@ -429,8 +431,15 @@ els.load.addEventListener('click', async () => {
   const vaeUrl = els.vaeUrl.value.trim();
   if (!vaeBytes && !vaeUrl) {
     els.load.disabled = false;
-    say('no AudioVAE source: give a URL or select the converted ' +
-        'audiovae.safetensors under "AudioVAE source".', 'error');
+    say('no AudioVAE source. Three ways to fix it, under "AudioVAE source":\n' +
+        '  1. Select your converted audiovae.safetensors (read in this tab, ' +
+        'never uploaded).\n' +
+        '  2. Serve it from your own machine, with CORS so this page may read it:\n' +
+        '     python3 scripts/serve.py --model DIR --tailscale --cors ' +
+        location.origin + '\n' +
+        '  3. Upload it to a Hugging Face repo and paste that URL.\n' +
+        'Convert it once with:  cargo run --release --example convert_audiovae ' +
+        '--no-default-features --features cpu -- <checkpoint-dir>', 'error');
     return;
   }
   const sources = { base };
@@ -744,13 +753,37 @@ els.save.addEventListener('click', () => {
 });
 
 setReference(null);
-// A page served from anywhere but the host itself has no /models to read,
-// so default to Hugging Face.
 const wantedPrecision = new URL(location.href).searchParams.get('precision');
 if (wantedPrecision && ['auto', 'f16', 'f32'].includes(wantedPrecision)) {
   els.precision.value = wantedPrecision;
 }
-const isLocal = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
-els.sourcePreset.value = isLocal ? 'local' : 'hf';
-applySourcePreset();
-boot();
+
+// Does this origin actually have a checkpoint mounted at /models?
+//
+// Checking beats guessing from the hostname. `scripts/serve.py --model DIR`
+// mounts one at /models on whatever address it binds, a Tailscale address
+// included, so a page served from there should use it rather than pull
+// 4.4 GB from Hugging Face. A page on GitHub Pages has no /models and
+// falls back.
+async function hasLocalModels() {
+  try {
+    const r = await fetch('/models/config.json', {
+      headers: { Range: 'bytes=0-0' },
+      cache: 'no-store',
+    });
+    return r.ok || r.status === 206;
+  } catch {
+    return false;
+  }
+}
+
+(async () => {
+  const local = await hasLocalModels();
+  els.sourcePreset.value = local ? 'local' : 'hf';
+  applySourcePreset();
+  if (local) {
+    say('found a checkpoint at /models on this server, so using it instead of ' +
+        'downloading 4.4 GB from Hugging Face.');
+  }
+  boot();
+})();

@@ -70,7 +70,25 @@ class RangeHandler(SimpleHTTPRequestHandler):
     """SimpleHTTPRequestHandler plus single-range `bytes=` support."""
 
     model_dir = None
+    allow_origin = None
     protocol_version = "HTTP/1.1"
+
+    def do_OPTIONS(self):
+        """Answer the CORS preflight that a `Range` request triggers.
+
+        `Range` is not a CORS-safelisted request header, so a
+        cross-origin fetch of the checkpoint sends `OPTIONS` first.
+        Without a reply that allows it, the browser never issues the GET.
+        """
+        if not self.allow_origin:
+            self.send_error(405, "OPTIONS not supported (use --cors to enable)")
+            return
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Range")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def translate_path(self, path):
         # Mount the checkpoint directory at /models so a multi-gigabyte
@@ -94,6 +112,16 @@ class RangeHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Accept-Ranges", "bytes")
+        if self.allow_origin:
+            self.send_header("Access-Control-Allow-Origin", self.allow_origin)
+            if self.allow_origin != "*":
+                self.send_header("Vary", "Origin")
+            # The loader reads the total size out of Content-Range, so it
+            # has to be readable from script.
+            self.send_header(
+                "Access-Control-Expose-Headers",
+                "Content-Range, Content-Length, Accept-Ranges",
+            )
         # Needed if an AudioWorklet ring buffer wants SharedArrayBuffer.
         self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Cross-Origin-Embedder-Policy", "require-corp")
@@ -283,6 +311,14 @@ def main():
                          "a secure context (required for WebGPU)")
     ap.add_argument("--tls-cert", default=None, help="PEM certificate (implies HTTPS)")
     ap.add_argument("--tls-key", default=None, help="PEM private key")
+    ap.add_argument("--cors", nargs="?", const="*", default=None,
+                    metavar="ORIGIN",
+                    help="send CORS headers so a page on another origin (e.g. a "
+                         "GitHub Pages deployment) can fetch the checkpoint from "
+                         "here. Pass an explicit origin like "
+                         "https://you.github.io to restrict it; bare --cors "
+                         "allows any origin, which lets any site you visit read "
+                         "files from this server")
     ap.add_argument("--cert-dir",
                     default=os.path.join(
                         os.environ.get("XDG_CACHE_HOME",
@@ -343,6 +379,7 @@ def main():
 
     scheme = "https" if ssl_ctx else "http"
     RangeHandler.model_dir = model
+    RangeHandler.allow_origin = args.cors
 
     class Handler(RangeHandler):
         def __init__(self, *a, **kw):
@@ -375,6 +412,14 @@ def main():
             size = f"{os.path.getsize(p)/1048576:.1f} MB" if os.path.exists(p) else ""
             print(f"    [{mark}] {name} {size}")
     print("\nRange requests: enabled (required)")
+    if args.cors == "*":
+        print(
+            "CORS: Access-Control-Allow-Origin: *  — any site you visit can read\n"
+            "      files from this server while it runs. Prefer\n"
+            "      --cors https://your.github.io to limit it."
+        )
+    elif args.cors:
+        print(f"CORS: Access-Control-Allow-Origin: {args.cors}")
     if ssl_ctx is None and addrs != ["127.0.0.1"]:
         print(
             "\nWARNING: serving plain HTTP on a non-loopback address. WebGPU needs a\n"
