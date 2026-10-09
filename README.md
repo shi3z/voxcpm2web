@@ -157,19 +157,38 @@ With `--both` deployed, the page's **Weight precision** selector offers:
 
 | | |
 | --- | --- |
-| Auto *(default)* | F16 when the adapter reports `shader-f16`, else F32 |
-| F16 | 4.37 GB of VRAM. Refused with an explicit message if `shader-f16` is missing |
-| F32 | 8.74 GB of VRAM. The correctness reference |
+| Auto *(default)* | **F32** — F16 is not selected automatically while its reduce bug stands |
+| F32 | 8.74 GB of VRAM. Verified to match a native run exactly |
+| F16 | 4.37 GB of VRAM. **Reductions are currently wrong** — see below. Refused outright if `shader-f16` is missing |
 
 Changing it reloads the page with `?precision=…`, because the GPU device
 is already registered with cubecl by then and swapping modules in place
 is not safe.
 
+> ### F16 is currently broken
+>
+> On the first run on real hardware WebGPU with `shader-f16`, the F16
+> build got **matmul right and reductions wrong**:
+>
+> ```
+> self-test FAILED: reduce test FAILED: mean 1 != 2.5
+> ```
+>
+> `mean([1,2,3,4])` returned `1`. Reductions back every RMSNorm and the
+> stop head, so this build does not produce quiet or missing audio — it
+> produces *wrong* audio. Auto therefore selects **F32**, and F16 is
+> opt-in with a warning until this is fixed.
+>
+> The self-test now runs 17 reduce probes (sum/mean/max/min, a length
+> sweep over `ones`, and argmax) and reports every value, so one run
+> localizes the fault. If you can run it on an F16-capable GPU, that
+> output plus the Diagnostics panel is exactly what is needed.
+
 F16 halves both the VRAM and the peak WASM heap, and is what makes this
-reach an 8 GB laptop GPU rather than needing a 12 GB card. It is wired
-and it builds, but **it has not been verified numerically**, and the
-reason is worth stating precisely because it is not "we didn't get
-round to it":
+reach an 8 GB laptop GPU rather than needing a 12 GB card. It builds, and
+the bundle loads and runs matmuls, but its reductions are wrong (above).
+Before that was known, it could not be verified here at all, for a
+separate reason worth recording:
 
 ```
 $ cargo run --release --example gpu_features --no-default-features --features wgpu
@@ -188,9 +207,9 @@ either. So neither route to verification was available here.
 Note that the native failure does **not** imply the browser build is
 broken: native `wgpu` validates WGSL through naga, whereas in a browser
 the WGSL is compiled by the browser itself (Dawn, in Chrome), and
-`wgpu`'s wasm backend hands it straight over. A browser whose adapter
-reports `shader-f16` is a genuinely separate question — it is simply an
-open one.
+`wgpu`'s wasm backend hands it straight over. That turned out to be the
+right call — the browser build *does* load and compute matmuls on an
+f16-capable GPU. Its reduce kernels are what is wrong.
 
 `examples/gpu_features.rs` prints the above for your own hardware, which
 is quicker than waiting out a 4.4 GB load to find out.

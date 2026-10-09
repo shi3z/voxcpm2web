@@ -219,11 +219,19 @@ async function fillDiagnostics() {
 // leaves the other absent, so a missing bundle falls back rather than
 // failing.
 async function loadWasm(want, shaderF16) {
+  // Auto prefers F32, even when the adapter reports shader-f16.
+  //
+  // F16 is not trusted yet: on the first real hardware WebGPU run, f16
+  // matmul was correct but the reduce was wrong (`mean([1,2,3,4])`
+  // returned 1 instead of 2.5). Reduce backs every RMSNorm and the stop
+  // head, so that build produces garbage audio. F32 is the configuration
+  // verified to match a native run exactly, so it is what Auto picks
+  // until F16 is fixed. Choose F16 explicitly to help test it.
   const order =
     want === 'f16' ? ['f16']
     : want === 'f32' ? ['f32']
-    : shaderF16 ? ['f16', 'f32']
-    : ['f32'];
+    : ['f32', 'f16'];
+  void shaderF16;
 
   let lastErr = null;
   for (const p of order) {
@@ -279,6 +287,10 @@ async function boot() {
     if (want === 'f16' && !shaderF16) {
       say('F16 was requested but this adapter does not report shader-f16. ' +
           'It will load and then refuse — pick Auto or F32.', 'error');
+    } else if (want === 'f16') {
+      say('F16 is known to compute reductions incorrectly on at least one GPU ' +
+          '(mean([1,2,3,4]) returned 1). Run the self-test before trusting any ' +
+          'audio it produces.', 'error');
     }
     const chosen = await loadWasm(want, shaderF16);
     wasm = chosen.exports;

@@ -413,25 +413,106 @@ pub async fn webgpu_self_test() -> Result<String, JsValue> {
         )));
     }
 
-    // Exercise a reduction and an elementwise chain too — matmul alone
-    // would not catch a broken reduce kernel, which the stop head needs.
-    let t = Tensor::<WebBackend, 1>::from_floats([1.0f32, 2.0, 3.0, 4.0], &device);
-    let mean = t
-        .clone()
-        .mean()
-        .into_data_async()
-        .await
-        .map_err(|e| err(format!("reduce readback failed: {e:?}")))?
-        .convert::<f32>()
-        .into_vec::<f32>()
-        .map_err(|_| err("unexpected reduce dtype"))?[0];
-    if (mean - 2.5).abs() > 1e-3 {
-        return Err(err(format!("reduce test FAILED: mean {mean} != 2.5")));
+    // Reductions get their own battery, because matmul passing says
+    // nothing about them and the model leans on them hard: every RMSNorm
+    // is a mean, and the stop head is an argmax. A broken reduce yields
+    // audio that is wrong rather than absent.
+    //
+    // Every probe runs and reports its value even after one fails, so a
+    // single run localizes the fault — length-dependent errors point at
+    // line-size / vectorization, a correct sum with a wrong mean points at
+    // the divisor, and so on.
+    let mut report: Vec<String> = Vec::new();
+    let mut failures = 0usize;
+
+    async fn scalar_of(t: Tensor<WebBackend, 1>) -> Result<f32, JsValue> {
+        let v = t
+            .into_data_async()
+            .await
+            .map_err(|e| err(format!("reduce readback failed: {e:?}")))?
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .map_err(|_| err("unexpected reduce dtype"))?;
+        v.first()
+            .copied()
+            .ok_or_else(|| err("reduce returned no elements"))
     }
 
-    Ok(format!(
-        "WebGPU available\nadapter: {adapter}\nmatrix test: PASS ({n}x{n} matmul, sum={sum})\nreduce test: PASS (mean={mean})"
-    ))
+    let mut check = |label: &str, got: f32, want: f32, report: &mut Vec<String>| {
+        // f16 has ~3 decimal digits, so scale the tolerance with the value.
+        let tol = (want.abs() * 1e-2).max(1e-2);
+        if (got - want).abs() <= tol {
+            report.push(format!("  {label:<28} {got:>12.4}   ok"));
+        } else {
+            failures += 1;
+            report.push(format!("  {label:<28} {got:>12.4}   FAIL, expected {want}"));
+        }
+    };
+
+    let t4 = || Tensor::<WebBackend, 1>::from_floats([1.0f32, 2.0, 3.0, 4.0], &device);
+    check("sum([1,2,3,4])", scalar_of(t4().sum()).await?, 10.0, &mut report);
+    check("mean([1,2,3,4])", scalar_of(t4().mean()).await?, 2.5, &mut report);
+    check("max([1,2,3,4])", scalar_of(t4().max()).await?, 4.0, &mut report);
+    check("min([1,2,3,4])", scalar_of(t4().min()).await?, 1.0, &mut report);
+
+    // Length sweep over ones: sum must equal the length, mean must be 1.
+    // A vectorized reduce that mishandles its line size usually breaks at
+    // some lengths and not others.
+    for len in [1usize, 2, 3, 8, 64, 1024] {
+        let ones = Tensor::<WebBackend, 1>::ones([len], &device);
+        check(
+            &format!("sum(ones[{len}])"),
+            scalar_of(ones.clone().sum()).await?,
+            len as f32,
+            &mut report,
+        );
+        check(
+            &format!("mean(ones[{len}])"),
+            scalar_of(ones.mean()).await?,
+            1.0,
+            &mut report,
+        );
+    }
+
+    // argmax is what the stop head uses to decide when to stop talking.
+    let t = Tensor::<WebBackend, 1>::from_floats([0.1f32, 0.9, 0.3, 0.2], &device);
+    let arg = t
+        .argmax(0)
+        .into_data_async()
+        .await
+        .map_err(|e| err(format!("argmax readback failed: {e:?}")))?
+        .iter::<i64>()
+        .next()
+        .unwrap_or(-1);
+    if arg == 1 {
+        report.push(format!("  {:<28} {arg:>12}   ok", "argmax([.1,.9,.3,.2])"));
+    } else {
+        failures += 1;
+        report.push(format!(
+            "  {:<28} {arg:>12}   FAIL, expected 1",
+            "argmax([.1,.9,.3,.2])"
+        ));
+    }
+
+    let body = format!(
+        "WebGPU available\nadapter: {adapter}\nprecision: {PRECISION}\n\n\
+         matrix test: PASS ({n}x{n} matmul, sum={sum})\n\n\
+         reduce tests:\n{}",
+        report.join("\n")
+    );
+
+    if failures > 0 {
+        return Err(err(format!(
+            "{body}\n\n{failures} reduce probe(s) FAILED. Reductions back every \
+             RMSNorm and the stop head, so this build would produce wrong audio \
+             rather than none.\n\n\
+             If precision is f16, use f32 instead (append ?precision=f32) — f32 is \
+             verified to match a native run exactly. Please report this output along \
+             with the Diagnostics panel."
+        )));
+    }
+
+    Ok(format!("{body}\n\nall reduce probes PASS"))
 }
 
 // ---------------------------------------------------------------------------

@@ -27,9 +27,9 @@
     <label class="field">
       <span>Weight precision</span>
       <select id="precision">
-        <option value="auto">Auto — F16 when the GPU supports shader-f16, else F32</option>
-        <option value="f16">F16 — 4.37 GB of VRAM, needs shader-f16</option>
-        <option value="f32">F32 — 8.74 GB of VRAM, the correctness reference</option>
+        <option value="auto">Auto — F32 (F16 has a known reduce bug)</option>
+        <option value="f32">F32 — 8.74 GB of VRAM, verified correct</option>
+        <option value="f16">F16 — 4.37 GB of VRAM, needs shader-f16. BROKEN: reductions are wrong</option>
       </select>
     </label>
     <label class="field">
