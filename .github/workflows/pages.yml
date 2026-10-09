@@ -106,18 +106,48 @@ jobs:
           echo "--- total ---"
           du -sh site
 
-      - uses: actions/configure-pages@v5
-        # Creates the Pages site on first run, so no manual switch in
-        # Settings is needed.
+      # Always keep the built site retrievable, whether or not Pages is
+      # set up. A one-time repository setting should not cost you the
+      # 20 minutes of compiling above.
+      - name: Upload the site as a build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site
+          retention-days: 14
+
+      - id: pages
+        uses: actions/configure-pages@v5
+        # `enablement` only works when the repository already permits
+        # Actions to create the Pages site. On a repo where Pages has
+        # never been configured this usually fails, so it must not take
+        # the whole build down with it.
+        continue-on-error: true
         with:
           enablement: true
 
+      - name: Explain how to finish enabling Pages
+        if: steps.pages.outcome != 'success'
+        run: |
+          echo "::warning title=Pages not enabled::The site built fine and is \
+          attached to this run as the 'site' artifact, but it was not deployed: \
+          GitHub Pages has never been configured for this repository and the \
+          workflow token is not allowed to turn it on. Enable it once under \
+          Settings -> Pages -> Build and deployment -> Source: GitHub Actions, \
+          then re-run this workflow."
+
       - uses: actions/upload-pages-artifact@v3
+        if: steps.pages.outcome == 'success'
         with:
           path: site
 
+    outputs:
+      pages_ready: ${{ steps.pages.outcome }}
+
   deploy:
     needs: build
+    # Skipped, rather than failed, when Pages is not set up yet.
+    if: needs.build.outputs.pages_ready == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

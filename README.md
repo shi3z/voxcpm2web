@@ -167,13 +167,39 @@ is not safe.
 
 F16 halves both the VRAM and the peak WASM heap, and is what makes this
 reach an 8 GB laptop GPU rather than needing a 12 GB card. It is wired
-and it builds, but **it has not been verified numerically** — the test
-machine's browser only ever got a SwiftShader adapter, which has no
-`shader-f16`. The thing to watch is the AudioVAE's transposed
-convolutions, which sum ~32k products per output; that is the reduction
-that collapsed in BF16 and motivated the vendored `burn-cubecl` patch.
-That patch accumulates in F32 regardless of element type, so it should
-cover F16 too — but should is not the same as does.
+and it builds, but **it has not been verified numerically**, and the
+reason is worth stating precisely because it is not "we didn't get
+round to it":
+
+```
+$ cargo run --release --example gpu_features --no-default-features --features wgpu
+adapter      : NVIDIA GeForce RTX 4090 (Vulkan)
+                        adapter  device
+  SHADER_F16             no       no
+```
+
+`wgpu` 26's Vulkan backend does not advertise `SHADER_F16` on this
+driver, so the native WGSL path cannot run f16 at all — it fails in naga
+validation with *"Using `f16` values requires the
+`naga::valid::Capabilities::FLOAT16` flag"*. And the test machine's
+browser only ever got a SwiftShader adapter, which has no `shader-f16`
+either. So neither route to verification was available here.
+
+Note that the native failure does **not** imply the browser build is
+broken: native `wgpu` validates WGSL through naga, whereas in a browser
+the WGSL is compiled by the browser itself (Dawn, in Chrome), and
+`wgpu`'s wasm backend hands it straight over. A browser whose adapter
+reports `shader-f16` is a genuinely separate question — it is simply an
+open one.
+
+`examples/gpu_features.rs` prints the above for your own hardware, which
+is quicker than waiting out a 4.4 GB load to find out.
+
+The thing to watch if you do try it: the AudioVAE's transposed
+convolutions sum ~32k products per output. That is the reduction that
+collapsed in BF16 and motivated the vendored `burn-cubecl` patch. The
+patch accumulates in F32 regardless of element type, so it should cover
+F16 too — but should is not the same as does.
 
 ## Quick start
 
@@ -438,7 +464,11 @@ Worth knowing about the layout:
 - `web/` — the UI. No framework; `index.html` + `main.js` + `style.css`.
 - `scripts/` — `build-web.sh`, `serve.py` (Range + HTTPS), `compare_pcm.py`.
 - `examples/stream_load.rs` — runs the browser's loader and inference paths
-  natively, which is far easier to debug than a tab.
+  natively, which is far easier to debug than a tab. `--async`, `--stream`
+  and `--f16` select the browser's code paths.
+- `examples/gpu_features.rs` — prints what your GPU backend actually
+  supports (`SHADER_F16`, buffer limits, workgroup limits), which answers
+  "will `--f16` work here?" in seconds instead of after a 4.4 GB load.
 
 The crate is still named `voxcpm-rs` and its `Cargo.toml` metadata still
 points at upstream, deliberately: this is that library plus a browser

@@ -189,10 +189,19 @@ Ordered by payoff per unit of risk. Not yet implemented.
 **A. F16 end-to-end** — `--features webgpu-f16`. Halves both budgets
 (8.74 → 4.37 GB GPU, ~2.0 → ~1.1 GB WASM peak) and is the difference
 between "needs a 12 GB card" and "runs on an 8 GB laptop GPU". The
-plumbing is already in place: `burn-cubecl` implements `FloatElement` for
+plumbing is in place: `burn-cubecl` implements `FloatElement` for
 `half::f16`, and `cubecl-wgpu` registers `FloatKind::F16` whenever the
-adapter reports `shader-f16`. The open question is numerical, not
-mechanical — the AudioVAE's transposed convolutions sum ~32k products per
+adapter reports `shader-f16`. The bundle builds, and the page will load
+it and refuse cleanly if the adapter lacks the feature.
+
+It is **unverified**, and not for lack of trying: `wgpu` 26's Vulkan
+backend reports `SHADER_F16: no` on an RTX 4090 / driver 590.48.01
+(see `examples/gpu_features.rs`), so f16 kernels fail naga validation on
+the native WGSL path; and the browser used for testing only ever got a
+SwiftShader adapter, which has no `shader-f16`. The native failure says
+nothing about the browser — there, WGSL is compiled by Dawn, not naga.
+
+The remaining question is numerical, not mechanical — the AudioVAE's transposed convolutions sum ~32k products per
 output, which is exactly the reduction that collapsed in BF16 and
 motivated the vendored `burn-cubecl` patch in `patches/`. That patch
 accumulates conv sums in F32 regardless of element type, so it should

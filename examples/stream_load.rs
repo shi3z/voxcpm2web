@@ -28,12 +28,22 @@ use voxcpm_rs::stream::{self, Checkpoint, FileSource, LogProgress};
 use voxcpm_rs::weights::{self, Namespace};
 use voxcpm_rs::{GenerateOptions, TextTokenizer, VoxCPM, VoxCpm2Config};
 
+/// The default element type, matching the browser's `webgpu` build.
 #[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
 type B = burn::backend::Wgpu<f32, i32>;
+/// `--f16`: matches the browser's `webgpu-f16` build. Same WGSL compiler
+/// path, so this is the closest thing to testing that build without a
+/// browser that can reach a GPU.
+#[cfg(all(feature = "wgpu", not(feature = "vulkan")))]
+type BF16 = burn::backend::Wgpu<half::f16, i32>;
 #[cfg(all(feature = "wgpu", feature = "vulkan"))]
 type B = burn::backend::Vulkan<half::bf16, i32>;
+#[cfg(all(feature = "wgpu", feature = "vulkan"))]
+type BF16 = burn::backend::Vulkan<half::f16, i32>;
 #[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
 type B = burn::backend::NdArray<f32>;
+#[cfg(all(not(feature = "wgpu"), not(feature = "vulkan"), feature = "cpu"))]
+type BF16 = burn::backend::NdArray<half::f16>;
 
 /// A global allocator that tracks live and peak heap bytes.
 ///
@@ -126,6 +136,7 @@ fn main() {
     let mut budget_mb = stream::DEFAULT_BATCH_BUDGET / (1024 * 1024);
     let mut use_async = false;
     let mut use_stream = false;
+    let mut use_f16 = false;
     let mut max_len: Option<usize> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(a) = argv.next() {
@@ -135,6 +146,7 @@ fn main() {
             }
             "--max-len" => max_len = argv.next().and_then(|v| v.parse().ok()),
             "--async" => use_async = true,
+            "--f16" => use_f16 = true,
             "--stream" => {
                 use_stream = true;
                 use_async = true;
@@ -142,11 +154,13 @@ fn main() {
             "-h" | "--help" => {
                 println!(
                     "usage: stream_load <checkpoint-dir> [text] [out.wav] \
-                     [--budget-mb N] [--max-len N] [--async] [--stream]\n\n\
+                     [--budget-mb N] [--max-len N] [--async] [--stream] [--f16]\n\n\
                      --async   drive generation through `generate_async`, the browser's\n\
                      \x20         code path, instead of the blocking `generate`.\n\
                      --stream  drive it through `GenerateStream::next_chunk_async`,\n\
-                     \x20         the browser's streaming path; reports time-to-first-audio.\n\n\
+                     \x20         the browser's streaming path; reports time-to-first-audio.\n\
+                     --f16     run with f16 weights, matching the browser's\n\
+                     \x20         `webgpu-f16` build instead of the default f32.\n\n\
                      Requires audiovae.safetensors — run the convert_audiovae example first."
                 );
                 return;
@@ -168,6 +182,28 @@ fn main() {
         .unwrap_or_else(|| "/tmp/stream_load.wav".to_string());
     let budget = budget_mb * 1024 * 1024;
 
+    if use_f16 {
+        run::<BF16>(&dir, &text, &out, budget, use_async, use_stream, max_len, "f16");
+    } else {
+        run::<B>(&dir, &text, &out, budget, use_async, use_stream, max_len, "f32");
+    }
+}
+
+/// The whole pipeline, generic over the element type so `--f16` and the
+/// default share one implementation.
+#[allow(clippy::too_many_arguments)]
+fn run<Bk: burn::prelude::Backend>(
+    dir: &std::path::Path,
+    text: &str,
+    out: &str,
+    budget: u64,
+    use_async: bool,
+    use_stream: bool,
+    max_len: Option<usize>,
+    precision: &str,
+) {
+    println!("element type: {precision}");
+
     let device = Default::default();
     let t_total = std::time::Instant::now();
 
@@ -180,14 +216,18 @@ fn main() {
 
     println!("allocating module tree...");
     let t = std::time::Instant::now();
-    let mut model = voxcpm_rs::voxcpm2::VoxCpm2Model::<B>::new(config, &device);
+    let mut model = voxcpm_rs::voxcpm2::VoxCpm2Model::<Bk>::new(config, &device);
     println!("  {:.1}s", t.elapsed().as_secs_f64());
 
     let mut acc = weights::empty_apply_result();
 
     // --- model.safetensors, streamed ------------------------------------
     let model_path = dir.join("model.safetensors");
-    println!("streaming {} (budget {budget_mb} MB/batch)", model_path.display());
+    println!(
+        "streaming {} (budget {} MB/batch)",
+        model_path.display(),
+        budget / (1024 * 1024)
+    );
     let t = std::time::Instant::now();
     let src = FileSource::open(&model_path).expect("open model.safetensors");
     let checkpoint = stream::block_on_ready(Checkpoint::open(&src)).expect("parse header");
@@ -217,7 +257,7 @@ fn main() {
             .unwrap_or_default()
     );
 
-    let r = stream::block_on_ready(stream::stream_into::<B, _, _, _>(
+    let r = stream::block_on_ready(stream::stream_into::<Bk, _, _, _>(
         &mut model,
         &src,
         &checkpoint,
@@ -245,7 +285,7 @@ fn main() {
     let t = std::time::Instant::now();
     let vae_src = FileSource::open(&vae_path).expect("open audiovae.safetensors");
     let vae_checkpoint = stream::block_on_ready(Checkpoint::open(&vae_src)).expect("parse vae header");
-    let r = stream::block_on_ready(stream::stream_into::<B, _, _, _>(
+    let r = stream::block_on_ready(stream::stream_into::<Bk, _, _, _>(
         &mut model,
         &vae_src,
         &vae_checkpoint,
@@ -312,7 +352,7 @@ fn main() {
         // The browser's streaming path. Each chunk is produced by running
         // up to `chunk_patches` AR steps and then decoding — real
         // incremental generation, not a finished waveform sliced up.
-        let mut stream = voxcpm.generate_stream(&text, opts).expect("generate_stream");
+        let mut stream = voxcpm.generate_stream(text, opts).expect("generate_stream");
         let mut all: Vec<f32> = Vec::new();
         let mut first: Option<f64> = None;
         let mut chunks = 0usize;
@@ -353,9 +393,9 @@ fn main() {
         // same thing as the sync one — the part of the port that a
         // software-rasterizer browser test cannot say anything useful
         // about.
-        stream::block_on_ready(voxcpm.generate_async(&text, opts)).expect("generate_async")
+        stream::block_on_ready(voxcpm.generate_async(text, opts)).expect("generate_async")
     } else {
-        voxcpm.generate(&text, opts).expect("generate")
+        voxcpm.generate(text, opts).expect("generate")
     };
     let gen_s = t.elapsed().as_secs_f64();
 
@@ -380,7 +420,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    voxcpm_rs::audio::write_wav(&out, &pcm, sr).expect("write wav");
+    voxcpm_rs::audio::write_wav(out, &pcm, sr).expect("write wav");
     println!("wrote {out}");
 
     // Raw little-endian f32, for comparing against the browser's
