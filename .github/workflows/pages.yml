@@ -97,7 +97,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p site
-          cp -r web/index.html web/main.js web/style.css web/pkg web/pkg-f16 site/
+          cp -r web/index.html web/main.js web/style.css web/favicon.svg \
+                web/pkg web/pkg-f16 site/
           # Pages runs Jekyll by default, which would skip paths it does
           # not like. This turns that off.
           touch site/.nojekyll
