@@ -455,9 +455,18 @@ pub async fn webgpu_self_test() -> Result<String, JsValue> {
     check("max([1,2,3,4])", scalar_of(t4().max()).await?, 4.0, &mut report);
     check("min([1,2,3,4])", scalar_of(t4().min()).await?, 1.0, &mut report);
 
-    // Length sweep over ones: sum must equal the length, mean must be 1.
-    // A vectorized reduce that mishandles its line size usually breaks at
-    // some lengths and not others.
+    // A reduce that reads the same element repeatedly — the classic
+    // line-size / stride bug — still gets `ones` exactly right, so these
+    // use non-uniform data. `mean([1,2,3,4]) == 1` (the value actually
+    // observed on f16 hardware) is what summing x[0] four times and
+    // dividing by four produces, so this is the shape of bug to probe
+    // for.
+    let skew = || Tensor::<WebBackend, 1>::from_floats([5.0f32, 1.0, 1.0, 1.0], &device);
+    // Reading x[0] four times would give sum 20 / mean 5 instead.
+    check("sum([5,1,1,1])", scalar_of(skew().sum()).await?, 8.0, &mut report);
+    check("mean([5,1,1,1])", scalar_of(skew().mean()).await?, 2.0, &mut report);
+
+    // Length sweep over ones: catches an outright broken element count.
     for len in [1usize, 2, 3, 8, 64, 1024] {
         let ones = Tensor::<WebBackend, 1>::ones([len], &device);
         check(
@@ -473,6 +482,55 @@ pub async fn webgpu_self_test() -> Result<String, JsValue> {
             &mut report,
         );
     }
+
+    // Length sweep over an alternating 0,1 pattern: the sum is
+    // index-sensitive, so a stride bug shows up as 0 or as the full
+    // length instead of half. Values stay small enough to be exact in
+    // f16 at every length here.
+    for len in [8usize, 64, 1024] {
+        let alt: Vec<f32> = (0..len).map(|i| (i % 2) as f32).collect();
+        let t = Tensor::<WebBackend, 1>::from_data(
+            burn::tensor::TensorData::new(alt, [len]),
+            &device,
+        );
+        check(
+            &format!("sum([0,1,0,1,...][{len}])"),
+            scalar_of(t.sum()).await?,
+            (len / 2) as f32,
+            &mut report,
+        );
+    }
+
+    // The model never takes a whole-tensor reduce in its hot path: every
+    // RMSNorm reduces the *last dimension* of a 2-D activation, which is
+    // a different cubek-reduce routine. Probe that separately.
+    let rows = Tensor::<WebBackend, 2>::from_data(
+        burn::tensor::TensorData::new(
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            [2, 4],
+        ),
+        &device,
+    );
+    let per_row = rows
+        .mean_dim(1)
+        .into_data_async()
+        .await
+        .map_err(|e| err(format!("mean_dim readback failed: {e:?}")))?
+        .convert::<f32>()
+        .into_vec::<f32>()
+        .map_err(|_| err("unexpected mean_dim dtype"))?;
+    check(
+        "mean_dim([[1..4],[5..8]],1)[0]",
+        per_row.first().copied().unwrap_or(f32::NAN),
+        2.5,
+        &mut report,
+    );
+    check(
+        "mean_dim([[1..4],[5..8]],1)[1]",
+        per_row.get(1).copied().unwrap_or(f32::NAN),
+        6.5,
+        &mut report,
+    );
 
     // argmax is what the stop head uses to decide when to stop talking.
     let t = Tensor::<WebBackend, 1>::from_floats([0.1f32, 0.9, 0.3, 0.2], &device);
