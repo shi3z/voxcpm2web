@@ -19,7 +19,9 @@ This is a port of [**voxcpm-rs**](https://github.com/mii-nipah/voxcpm-rs)
 — pure-Rust [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) inference on
 the [Burn](https://burn.dev) framework — to `wasm32-unknown-unknown` plus
 WebGPU. The model code is reused as-is; the work is in everything around
-it.
+it. Upstream's own documentation — the native backends, the Rust API tour,
+the architecture walkthrough — is preserved at
+[`docs/voxcpm-rs.md`](docs/voxcpm-rs.md).
 
 ---
 
@@ -337,6 +339,32 @@ rate on every normal run, with no NaN, Inf or clipping.
 - **Browser performance on real GPU hardware** — see the caveat above.
 
 ---
+
+## Documentation
+
+| | |
+| --- | --- |
+| [`docs/voxcpm-rs.md`](docs/voxcpm-rs.md) | The full library documentation: native backends (`cpu`, `cpu-blas`, `wgpu`, `wgpu-fast`, `vulkan`), the Rust API, voice cloning, batching, architecture. This is upstream's README, with a browser section added. |
+| [`docs/browser-port-analysis.md`](docs/browser-port-analysis.md) | The port survey: architecture, every blocker found and what was done about each, and what was and was not verified. |
+| [`docs/webgpu-memory.md`](docs/webgpu-memory.md) | Measured memory, per component, and the F16 / INT8 / INT4 plan. |
+| [`patches/README.md`](patches/README.md) | The vendored upstream fixes and why each is needed. |
+
+Worth knowing about the layout:
+
+- `src/stream.rs` — the streaming checkpoint loader. Platform-independent,
+  behind a `ByteSource` trait, so it runs over HTTP in a browser and over a
+  file natively.
+- `src/browser/` — the only wasm-only code: `fetch.rs` (HTTP Range),
+  `api.rs` (the `wasm_bindgen` surface).
+- `src/compat.rs` — the time and env-var shims.
+- `web/` — the UI. No framework; `index.html` + `main.js` + `style.css`.
+- `scripts/` — `build-web.sh`, `serve.py` (Range + HTTPS), `compare_pcm.py`.
+- `examples/stream_load.rs` — runs the browser's loader and inference paths
+  natively, which is far easier to debug than a tab.
+
+The crate is still named `voxcpm-rs` and its `Cargo.toml` metadata still
+points at upstream, deliberately: this is that library plus a browser
+target, not a rename.
 
 ## Credits
 

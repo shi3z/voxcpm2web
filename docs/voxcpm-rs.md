@@ -186,7 +186,7 @@ specific `rev = "…"` instead of `branch = "main"` for reproducible builds.
 > a patched dependency on its consumers' behalf — the patch block must live in
 > the consumer's manifest either way. A `git = "…"` reference is the lowest-
 > friction form that doesn't require maintaining renamed forks on crates.io.
-> See [`patches/README.md`](patches/README.md) for the patch contents and
+> See [`patches/README.md`](../patches/README.md) for the patch contents and
 > rationale.
 
 ## Browser: WASM + WebGPU
@@ -285,7 +285,7 @@ does **not**, and the loader will say so rather than trying to allocate
 | F16 (`webgpu-f16`) | 4.37 GB | ~1.1 GB |
 
 Full breakdown, measurements and the quantization plan:
-[`docs/webgpu-memory.md`](docs/webgpu-memory.md).
+[`docs/webgpu-memory.md`](webgpu-memory.md).
 
 ### It will not silently run on the CPU
 
@@ -347,11 +347,11 @@ judge *agreement* with it on, and quality with it off.
 
 ### Porting notes
 
-- [`docs/browser-port-analysis.md`](docs/browser-port-analysis.md) — the
+- [`docs/browser-port-analysis.md`](browser-port-analysis.md) — the
   architecture survey, every blocker found, and what was done about each.
-- [`docs/webgpu-memory.md`](docs/webgpu-memory.md) — measured memory and
+- [`docs/webgpu-memory.md`](webgpu-memory.md) — measured memory and
   the F16 / INT8 / INT4 plan.
-- [`patches/README.md`](patches/README.md) — includes the
+- [`patches/README.md`](../patches/README.md) — includes the
   `cubek-reduce` workgroup fix, without which the model cannot run on any
   WebGPU adapter at the spec-baseline limits.
 
@@ -420,7 +420,7 @@ let opts = GenerateOptions::builder()
 
 #### Audio from memory
 
-Prompt audio doesn't have to live on disk. [`PromptAudio`](src/voxcpm2/wrapper.rs)
+Prompt audio doesn't have to live on disk. [`PromptAudio`](../src/voxcpm2/wrapper.rs)
 accepts three sources — a path, already-encoded bytes, or raw PCM samples — so
 you can plug the model into an in-memory pipeline (microphone capture, HTTP
 upload, another TTS stage, …):
@@ -442,15 +442,15 @@ let c = Prompt::Reference {
 };
 ```
 
-Symmetrically, [`audio::load_audio_bytes`](src/audio.rs) /
-[`audio::load_audio_bytes_as`](src/audio.rs) let you decode encoded audio
+Symmetrically, [`audio::load_audio_bytes`](../src/audio.rs) /
+[`audio::load_audio_bytes_as`](../src/audio.rs) let you decode encoded audio
 buffers without touching the filesystem.
 
 ### Streaming
 
 For real-time playback, network streaming, or just to start hearing audio
 before the whole utterance is ready, use
-[`VoxCPM::generate_stream`](src/voxcpm2/wrapper.rs). It returns an iterator
+[`VoxCPM::generate_stream`](../src/voxcpm2/wrapper.rs). It returns an iterator
 of `Result<Vec<f32>>` chunks at `model.sample_rate()`:
 
 ```rust
@@ -470,7 +470,7 @@ decoder is causal. `chunk_patches` trades latency for throughput: smaller
 → lower per-chunk latency, larger → fewer chunks. The default `5` is a
 sensible balance for live playback.
 
-See [`examples/tts_stream.rs`](examples/tts_stream.rs) for an end-to-end
+See [`examples/tts_stream.rs`](../examples/tts_stream.rs) for an end-to-end
 run with per-chunk timing.
 
 > **Implementation note.** The autoregressive loop (LM + DiT) runs
@@ -598,7 +598,7 @@ Takeaways:
 - These numbers are hardware-specific. The shape of the curve
   (free-doubling at small B, peak somewhere around 4–8, regression past
   the GPU's saturation point) is universal — re-run
-  [`examples/batch_scale_sweep.rs`](examples/batch_scale_sweep.rs) on
+  [`examples/batch_scale_sweep.rs`](../examples/batch_scale_sweep.rs) on
   your own hardware to find your own sweet spot.
 
 For a server batching independent requests, target b=4–8 and queue
@@ -660,12 +660,12 @@ text ──► tokenizer ──► minicpm4 (LM backbone) ──► locenc ─�
 
 | Module                                | Role                                                   |
 | ------------------------------------- | ------------------------------------------------------ |
-| [`tokenizer`](src/tokenizer.rs)       | HF `tokenizers` wrapper for the LlamaTokenizerFast vocab. |
-| [`minicpm4`](src/minicpm4/)           | Decoder-only LM backbone (rotary attention + KV cache).   |
-| [`locenc`](src/locenc.rs)             | Local encoder — conditions the diffusion head on LM hidden states. |
-| [`locdit`](src/locdit/)               | Local DiT + conditional flow-matching sampler.         |
-| [`audiovae`](src/audiovae/)           | VAE decoder that turns FSQ patches into 16 kHz audio.  |
-| [`voxcpm2`](src/voxcpm2/)             | Glue + convenient [`VoxCPM`](src/voxcpm2/wrapper.rs) façade. |
+| [`tokenizer`](../src/tokenizer.rs)       | HF `tokenizers` wrapper for the LlamaTokenizerFast vocab. |
+| [`minicpm4`](../src/minicpm4/)           | Decoder-only LM backbone (rotary attention + KV cache).   |
+| [`locenc`](../src/locenc.rs)             | Local encoder — conditions the diffusion head on LM hidden states. |
+| [`locdit`](../src/locdit/)               | Local DiT + conditional flow-matching sampler.         |
+| [`audiovae`](../src/audiovae/)           | VAE decoder that turns FSQ patches into 16 kHz audio.  |
+| [`voxcpm2`](../src/voxcpm2/)             | Glue + convenient [`VoxCPM`](../src/voxcpm2/wrapper.rs) façade. |
 
 Weights are loaded directly from `.safetensors` or `.pth` via
 [`burn-store`](https://crates.io/crates/burn-store) with the `PyTorchToBurnAdapter`,
@@ -673,19 +673,19 @@ so HuggingFace checkpoints drop in with no manual conversion step.
 
 ## Examples
 
-Browse [`examples/`](examples/) for standalone binaries:
+Browse [`examples/`](../examples/) for standalone binaries:
 
-- [`tts.rs`](examples/tts.rs) — end-to-end synthesis.
-- [`tts_stream.rs`](examples/tts_stream.rs) — chunked streaming synthesis with per-chunk latency logging.
-- [`clone.rs`](examples/clone.rs) — voice cloning from a reference wav.
-- [`bench_parallel.rs`](examples/bench_parallel.rs) — RTF benchmark for `parallel_segments` (one long paragraph).
-- [`bench_batch.rs`](examples/bench_batch.rs) — RTF benchmark for `VoxCPM::batch()` (many independent utterances).
-- [`batch_varlen.rs`](examples/batch_varlen.rs) — 8 wildly-different-length utterances in one batched call (writes to `/tmp/voxbatching/`).
-- [`batch_scale_sweep.rs`](examples/batch_scale_sweep.rs) — sweep batch sizes 1→64 with uniform-length input to find your hardware's saturation point.
-- [`lm_check.rs`](examples/lm_check.rs), [`vae_check.rs`](examples/vae_check.rs),
-  [`feat_check.rs`](examples/feat_check.rs) — per-component parity checks against
+- [`tts.rs`](../examples/tts.rs) — end-to-end synthesis.
+- [`tts_stream.rs`](../examples/tts_stream.rs) — chunked streaming synthesis with per-chunk latency logging.
+- [`clone.rs`](../examples/clone.rs) — voice cloning from a reference wav.
+- [`bench_parallel.rs`](../examples/bench_parallel.rs) — RTF benchmark for `parallel_segments` (one long paragraph).
+- [`bench_batch.rs`](../examples/bench_batch.rs) — RTF benchmark for `VoxCPM::batch()` (many independent utterances).
+- [`batch_varlen.rs`](../examples/batch_varlen.rs) — 8 wildly-different-length utterances in one batched call (writes to `/tmp/voxbatching/`).
+- [`batch_scale_sweep.rs`](../examples/batch_scale_sweep.rs) — sweep batch sizes 1→64 with uniform-length input to find your hardware's saturation point.
+- [`lm_check.rs`](../examples/lm_check.rs), [`vae_check.rs`](../examples/vae_check.rs),
+  [`feat_check.rs`](../examples/feat_check.rs) — per-component parity checks against
   the reference implementation.
-- [`bench_rmsnorm.rs`](examples/bench_rmsnorm.rs) — microbench for hot kernels.
+- [`bench_rmsnorm.rs`](../examples/bench_rmsnorm.rs) — microbench for hot kernels.
 
 ## Contributing
 
@@ -707,8 +707,9 @@ Keep PRs focused — one feature or fix per PR makes review much easier.
 ## Related projects
 
 - [**VoxCPM** (official, Python)](https://github.com/OpenBMB/VoxCPM) — the
-  reference implementation this crate tracks. A copy lives under
-  [`vendor/VoxCPM`](vendor/VoxCPM/) for parity testing.
+  reference implementation this crate tracks. Check it out under
+  `vendor/VoxCPM/` for parity testing — that path is gitignored, so it is
+  not shipped here.
 - [**Burn**](https://github.com/tracel-ai/burn) — the ML framework powering all
   the tensor math here.
 - [**cubecl**](https://github.com/tracel-ai/cubecl) — the GPU kernel compiler
@@ -716,7 +717,7 @@ Keep PRs focused — one feature or fix per PR makes review much easier.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE). The vendored reference
+Licensed under the [Apache License, Version 2.0](../LICENSE). The vendored reference
 implementation under `vendor/VoxCPM/` (kept in the repository for parity testing,
 not shipped on crates.io) retains its own license — see the
 [upstream LICENSE](https://github.com/OpenBMB/VoxCPM/blob/main/LICENSE).
