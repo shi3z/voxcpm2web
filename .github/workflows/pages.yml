@@ -118,6 +118,14 @@ jobs:
       - name: Convert the AudioVAE and ship it with the site
         # Upstream has only the pickle. Converting it here is what lets a
         # visitor just open the page.
+        #
+        # Allowed to fail: it depends on Hugging Face being reachable, and
+        # a network hiccup should not also throw away the wasm build. If
+        # it does fail the site still deploys, the page detects the
+        # missing file and asks the visitor for one, and the warning below
+        # says what happened.
+        id: audiovae
+        continue-on-error: true
         run: |
           set -euo pipefail
           mkdir -p ckpt
@@ -130,16 +138,25 @@ jobs:
             --no-default-features --features cpu -- ckpt
           ls -l ckpt/audiovae.safetensors
 
+      - name: Warn if the AudioVAE is missing
+        if: steps.audiovae.outcome != 'success'
+        run: |
+          echo "::warning title=AudioVAE missing::Converting audiovae.pth failed, \
+          so the deployed page will not be self-contained: visitors will be asked \
+          to supply audiovae.safetensors themselves. Re-run this workflow once \
+          Hugging Face is reachable."
+
       - name: Assemble the site
         run: |
           set -euo pipefail
           mkdir -p site
           cp -r web/index.html web/main.js web/style.css web/favicon.svg \
                 web/pkg web/pkg-f16 site/
-          cp ckpt/audiovae.safetensors site/
-          # Apache-2.0 requires the licence to travel with redistributed
-          # material, and these are VoxCPM2's weights.
-          cp LICENSE site/MODEL-LICENSE.txt
+          if [ -f ckpt/audiovae.safetensors ]; then
+            cp ckpt/audiovae.safetensors site/
+            # Apache-2.0 requires the licence to travel with redistributed
+            # material, and these are VoxCPM2's weights.
+            cp LICENSE site/MODEL-LICENSE.txt
           cat > site/MODEL-NOTICE.txt <<'NOTICE'
           audiovae.safetensors in this directory is a format conversion of
           audiovae.pth from https://huggingface.co/openbmb/VoxCPM2
@@ -147,6 +164,9 @@ jobs:
           are unchanged; only the container format differs, because the
           browser build cannot read a Python pickle. See MODEL-LICENSE.txt.
           NOTICE
+          else
+            echo "WARNING: no audiovae.safetensors — the page will ask for one" >&2
+          fi
           # Pages runs Jekyll by default, which would skip paths it does
           # not like. This turns that off.
           touch site/.nojekyll
@@ -155,14 +175,18 @@ jobs:
           echo "--- total ---"
           du -sh site
 
-      # Always keep the built site retrievable, whether or not Pages is
-      # set up. A one-time repository setting should not cost you the
-      # 20 minutes of compiling above.
+      # Always keep the *expensive* part of the build retrievable, whether
+      # or not Pages is set up: a one-time repository setting should not
+      # cost you the compile above. The AudioVAE is excluded on purpose —
+      # it is 359 MB and a one-minute conversion, so storing a second copy
+      # of it on every run buys nothing.
       - name: Upload the site as a build artifact
         uses: actions/upload-artifact@v4
         with:
           name: site
-          path: site
+          path: |
+            site
+            !site/audiovae.safetensors
           retention-days: 14
 
       - id: pages
