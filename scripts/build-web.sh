@@ -69,14 +69,40 @@ for spec in "${TARGETS[@]}"; do
   wasm-bindgen "$WASM" --out-dir "$OUT" --target web --no-typescript
 
   # --- optional size pass ----------------------------------------------------
+  #
+  # wasm-opt is optional and *verified*, not trusted. Binaryen versions
+  # exist that reorder this module's two tables and rebind the
+  # `__wbindgen_externrefs` export to the funcref table, which is declared
+  # min == max and so cannot grow. The result validates, disassembles
+  # identically, and then fails on every page load with
+  # "WebAssembly.Table.grow(): failed to grow table by 4". So the
+  # optimized output is smoke-tested, and discarded if it regressed.
   if command -v wasm-opt >/dev/null 2>&1 && [ "$PROFILE" = release ]; then
-    echo "==> wasm-opt -O2"
-    wasm-opt -O2 --enable-bulk-memory --enable-nontrapping-float-to-int \
-      "$OUT/voxcpm_rs_bg.wasm" -o "$OUT/voxcpm_rs_bg.opt.wasm" \
-      && mv "$OUT/voxcpm_rs_bg.opt.wasm" "$OUT/voxcpm_rs_bg.wasm"
+    echo "==> wasm-opt -O2 ($(wasm-opt --version))"
+    if wasm-opt -O2 --enable-bulk-memory --enable-nontrapping-float-to-int \
+         --enable-reference-types \
+         "$OUT/voxcpm_rs_bg.wasm" -o "$OUT/voxcpm_rs_bg.opt.wasm"; then
+      if node scripts/check-wasm.mjs "$OUT/voxcpm_rs_bg.opt.wasm"; then
+        mv "$OUT/voxcpm_rs_bg.opt.wasm" "$OUT/voxcpm_rs_bg.wasm"
+      else
+        echo "!!! wasm-opt produced a broken module — keeping the unoptimized one." >&2
+        echo "!!! Upgrade binaryen (>= 123 is known good)." >&2
+        rm -f "$OUT/voxcpm_rs_bg.opt.wasm"
+      fi
+    else
+      echo "!!! wasm-opt failed — keeping the unoptimized module." >&2
+      rm -f "$OUT/voxcpm_rs_bg.opt.wasm"
+    fi
   else
     echo "==> skipping wasm-opt (not installed; optional)"
   fi
+
+  # --- always verify what we are about to ship --------------------------------
+  echo "==> smoke test"
+  node scripts/check-wasm.mjs "$OUT/voxcpm_rs_bg.wasm" || {
+    echo "error: $OUT will not work in a browser; refusing to continue" >&2
+    exit 1
+  }
 
   echo
   echo "built $OUT ($FEATURES, $PROFILE):"

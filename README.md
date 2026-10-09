@@ -469,6 +469,12 @@ Worth knowing about the layout:
 - `examples/gpu_features.rs` — prints what your GPU backend actually
   supports (`SHADER_F16`, buffer limits, workgroup limits), which answers
   "will `--f16` work here?" in seconds instead of after a 4.4 GB load.
+- `scripts/check-wasm.mjs` — instantiates a built bundle outside the
+  browser and performs the startup table growth that the generated glue
+  does. `build-web.sh` runs it on every bundle and refuses to finish if it
+  fails. It exists because a bad `wasm-opt` once shipped a module that
+  validated cleanly and then died on every page load; see the comment at
+  the top of the file.
 
 The crate is still named `voxcpm-rs` and its `Cargo.toml` metadata still
 points at upstream, deliberately: this is that library plus a browser

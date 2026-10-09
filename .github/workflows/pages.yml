@@ -84,13 +84,25 @@ jobs:
           fi
           wasm-bindgen --version
 
-      - name: Install wasm-opt
+      - name: Install binaryen
+        # Pinned, not apt's. The version Ubuntu ships rebinds this
+        # module's `__wbindgen_externrefs` export to the funcref table,
+        # which cannot grow, so every page load dies with
+        # "WebAssembly.Table.grow(): failed to grow table by 4". 123 is
+        # verified good; `scripts/check-wasm.mjs` catches it either way.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq binaryen
-          wasm-opt --version
+          set -euo pipefail
+          V=123
+          URL="https://github.com/WebAssembly/binaryen/releases/download/version_${V}/binaryen-version_${V}-x86_64-linux.tar.gz"
+          curl -sSfL "$URL" -o binaryen.tar.gz
+          tar xzf binaryen.tar.gz
+          echo "$PWD/binaryen-version_${V}/bin" >> "$GITHUB_PATH"
+          "$PWD/binaryen-version_${V}/bin/wasm-opt" --version
 
       - name: Build both precision bundles
+        # `build-web.sh` smoke-tests each bundle with
+        # scripts/check-wasm.mjs and fails here rather than deploying
+        # something that cannot start.
         run: scripts/build-web.sh --both
 
       - name: Assemble the site
