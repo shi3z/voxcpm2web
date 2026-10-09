@@ -78,11 +78,17 @@ const SOURCE_PRESETS = {
   },
   hf: {
     base: 'https://huggingface.co/openbmb/VoxCPM2/resolve/main',
-    // Deliberately blank: there is no public safetensors AudioVAE to
-    // point at, so the user supplies one.
+    // Filled in at boot if this deployment ships its own converted
+    // AudioVAE next to the page. Upstream publishes only a pickle, which
+    // the browser cannot read, so a hosted deployment converts it and
+    // serves it same-origin; that is what makes the demo need nothing
+    // from the visitor. Left blank when it is absent.
     vae: '',
   },
 };
+
+// Set once at boot: the site's own AudioVAE, if it has one.
+let siteAudioVae = '';
 
 // ---------------------------------------------------------------------------
 // Status log
@@ -327,8 +333,8 @@ function applySourcePreset() {
   const p = SOURCE_PRESETS[els.sourcePreset.value];
   if (!p) return;
   els.modelUrl.value = p.base;
-  els.vaeUrl.value = p.vae;
-  if (els.sourcePreset.value === 'hf' && !vaeBytes) {
+  els.vaeUrl.value = p.vae || siteAudioVae;
+  if (els.sourcePreset.value === 'hf' && !vaeBytes && !els.vaeUrl.value) {
     // Open the section, because this is the one thing the user has to do.
     $('vae-details').open = true;
     say('streaming weights from Hugging Face. The AudioVAE has no public ' +
@@ -765,25 +771,33 @@ if (wantedPrecision && ['auto', 'f16', 'f32'].includes(wantedPrecision)) {
 // included, so a page served from there should use it rather than pull
 // 4.4 GB from Hugging Face. A page on GitHub Pages has no /models and
 // falls back.
-async function hasLocalModels() {
+async function probe(url) {
   try {
-    const r = await fetch('/models/config.json', {
-      headers: { Range: 'bytes=0-0' },
-      cache: 'no-store',
-    });
+    const r = await fetch(url, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' });
     return r.ok || r.status === 206;
   } catch {
     return false;
   }
 }
 
+const hasLocalModels = () => probe('/models/config.json');
+// Relative, so it resolves under a subpath deployment like
+// /voxcpm2web/ as well as at a root.
+const hasSiteAudioVae = () => probe('audiovae.safetensors');
+
 (async () => {
-  const local = await hasLocalModels();
+  const [local, siteVae] = await Promise.all([hasLocalModels(), hasSiteAudioVae()]);
+  if (siteVae) {
+    siteAudioVae = 'audiovae.safetensors';
+  }
   els.sourcePreset.value = local ? 'local' : 'hf';
   applySourcePreset();
   if (local) {
     say('found a checkpoint at /models on this server, so using it instead of ' +
         'downloading 4.4 GB from Hugging Face.');
+  } else if (siteVae) {
+    say('weights stream from Hugging Face; the AudioVAE is served with this ' +
+        'page. Nothing for you to supply — just Load model.');
   }
   boot();
 })();

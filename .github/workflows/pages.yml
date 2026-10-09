@@ -7,10 +7,20 @@
 # cross-origin from Hugging Face instead, which serves HTTP Range requests
 # with `Access-Control-Allow-Origin` and exposes `Content-Range`.
 #
-# The one file with no public home is `audiovae.safetensors`: upstream
-# publishes only `audiovae.pth`, a Python pickle the browser build cannot
-# read, and no safetensors version is hosted anywhere. The page lets the
-# visitor select their own converted copy, or give a CORS-friendly URL.
+# The exception is `audiovae.safetensors`. Upstream publishes only
+# `audiovae.pth`, a Python pickle the browser build cannot read, and no
+# safetensors version is hosted anywhere public — so this workflow
+# converts it here and ships the 359 MB result *with the site*. That is
+# what makes the demo self-contained: a visitor opens the URL and nothing
+# else is required of them.
+#
+# VoxCPM2 is Apache-2.0 and not gated, so redistributing the converted
+# weights is permitted; the licence is shipped alongside them.
+#
+# Budget: ~359 MB (AudioVAE) + ~23 MB (two wasm bundles) is well inside
+# the 1 GB Pages site limit. Pages' ~100 GB/month soft bandwidth cap
+# works out to roughly 250 full loads; the 4.4 GB checkpoint comes from
+# Hugging Face, not from here.
 name: Deploy demo to Pages
 
 on:
@@ -105,12 +115,38 @@ jobs:
         # something that cannot start.
         run: scripts/build-web.sh --both
 
+      - name: Convert the AudioVAE and ship it with the site
+        # Upstream has only the pickle. Converting it here is what lets a
+        # visitor just open the page.
+        run: |
+          set -euo pipefail
+          mkdir -p ckpt
+          echo "downloading audiovae.pth"
+          curl -sSfL --retry 3 \
+            -o ckpt/audiovae.pth \
+            "https://huggingface.co/openbmb/VoxCPM2/resolve/main/audiovae.pth"
+          ls -l ckpt/audiovae.pth
+          cargo run --release --example convert_audiovae \
+            --no-default-features --features cpu -- ckpt
+          ls -l ckpt/audiovae.safetensors
+
       - name: Assemble the site
         run: |
           set -euo pipefail
           mkdir -p site
           cp -r web/index.html web/main.js web/style.css web/favicon.svg \
                 web/pkg web/pkg-f16 site/
+          cp ckpt/audiovae.safetensors site/
+          # Apache-2.0 requires the licence to travel with redistributed
+          # material, and these are VoxCPM2's weights.
+          cp LICENSE site/MODEL-LICENSE.txt
+          cat > site/MODEL-NOTICE.txt <<'NOTICE'
+          audiovae.safetensors in this directory is a format conversion of
+          audiovae.pth from https://huggingface.co/openbmb/VoxCPM2
+          (VoxCPM2 by OpenBMB, Apache-2.0). Tensor names, shapes and dtypes
+          are unchanged; only the container format differs, because the
+          browser build cannot read a Python pickle. See MODEL-LICENSE.txt.
+          NOTICE
           # Pages runs Jekyll by default, which would skip paths it does
           # not like. This turns that off.
           touch site/.nojekyll

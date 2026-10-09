@@ -29,21 +29,30 @@ the architecture walkthrough — is preserved at
 
 **https://shi3z.github.io/voxcpm2web/**
 
-GitHub Pages serves the page over HTTPS — a secure context, which WebGPU
-requires — and the weights stream in from Hugging Face. What it needs
-from you:
+Open it, press **Load model**, press **Generate**. Nothing to install,
+nothing to supply. All it asks of you is a GPU with enough VRAM (see
+[Requirements](#requirements)) and the patience for a 4.4 GB download.
 
-1. A GPU with the VRAM for the weights (see [Requirements](#requirements)).
-2. **One file you have to supply: `audiovae.safetensors`.** Upstream
-   publishes the AudioVAE only as `audiovae.pth`, a Python pickle this
-   build cannot read, and no `.safetensors` version is hosted anywhere
-   public. Convert it once (below) and select it in the page — it is read
-   in the tab and never uploaded. Or host your converted copy somewhere
-   that sends CORS headers (a Hugging Face repo works; **GitHub release
-   assets do not** — they answer `404` to the preflight and send no
-   `Access-Control-Allow-Origin`) and paste the URL.
+Where each piece comes from:
 
-### Why the model is not hosted on GitHub
+| | |
+| --- | --- |
+| page + wasm | GitHub Pages, over HTTPS (WebGPU needs a secure context) |
+| `config.json`, `tokenizer.json`, `model.safetensors` | streamed from Hugging Face by HTTP Range |
+| `audiovae.safetensors` | served with the page |
+
+That last row is the awkward one. Upstream publishes the AudioVAE only as
+`audiovae.pth`, a Python pickle the browser build cannot read, and no
+`.safetensors` version is hosted anywhere public. So the deploy workflow
+converts it in CI and ships the 359 MB result alongside the page —
+VoxCPM2 is Apache-2.0 and not gated, so that is permitted, and the
+licence travels with it (`MODEL-LICENSE.txt`, `MODEL-NOTICE.txt`).
+
+Without that the demo would not be a demo: it would only work for
+somebody who already had the converted file, which is nobody but the
+person who built it.
+
+### Why the checkpoint is not hosted on GitHub
 
 It cannot be. GitHub rejects any single file over **100 MB**, and a Pages
 site is capped at **1 GB**; `model.safetensors` is **4.37 GB**. Git LFS
@@ -68,6 +77,33 @@ Measured end to end, with the page on one origin and the checkpoint on
 Hugging Face: **474 s** to load, `applied=632, missing=0, unused=0,
 errors=0`. That is 4.4 GB over the public internet, so your mileage is
 your bandwidth. There is no local cache yet, so a reload re-downloads.
+
+The AudioVAE *is* small enough for Pages: ~359 MB plus ~23 MB of wasm
+sits well inside the 1 GB site limit. Pages' ~100 GB/month soft
+bandwidth cap works out to roughly 250 full loads a month — the 4.4 GB
+checkpoint comes from Hugging Face, not from here, so that is the only
+part this repo pays for.
+
+### Feeding your own weights instead
+
+The page checks what is actually reachable rather than guessing. If the
+origin serving it has a checkpoint at `/models` — which
+`scripts/serve.py --model DIR` mounts — it uses that and skips the
+download entirely. Useful when you are iterating locally or over a
+tailnet.
+
+To point the *hosted* page at weights on your own machine, that server
+has to send CORS headers:
+
+```bash
+python3 scripts/serve.py --model /path/to/VoxCPM2 --tailscale \
+    --cors https://YOU.github.io
+```
+
+`--cors` is opt-in and takes an origin; bare `--cors` allows any, which
+lets any site you visit read files from it while it runs. Note this is
+for your own convenience, not for the demo — a public demo cannot depend
+on a machine only you can reach.
 
 ---
 
@@ -291,26 +327,9 @@ Other situations:
 | Just want it local | the default — `http://localhost:8080` is already a secure context |
 | Cannot do HTTPS at all | on the *client*, launch Chrome with `--unsafely-treat-insecure-origin-as-secure=http://HOST:8080` |
 
-A page served this way needs no configuring: it probes `/models/config.json`
-on its own origin and, finding a checkpoint there, uses it instead of
-pulling 4.4 GB from Hugging Face.
-
-### Feeding your own weights to the hosted page
-
-You can also keep the page on GitHub Pages and serve the *weights* from
-your machine — which is the easiest answer to the AudioVAE problem, since
-you already have the converted file locally:
-
-```bash
-python3 scripts/serve.py --model /path/to/VoxCPM2 --tailscale \
-    --cors https://YOU.github.io
-```
-
-`--cors` is opt-in and takes an origin. Bare `--cors` allows any origin,
-which means any site you visit could read files from that server while it
-runs, so prefer naming the one origin. The preflight matters: `Range` is
-not a CORS-safelisted header, so the browser sends `OPTIONS` first, and
-the server answers it.
+A page served this way needs no configuring: it probes
+`/models/config.json` on its own origin and, finding a checkpoint there,
+uses it instead of downloading anything.
 
 The page diagnoses this itself: if it loads without a secure context it
 says so, and how to fix it, rather than blaming your GPU.
