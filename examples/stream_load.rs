@@ -374,8 +374,12 @@ fn run<Bk: burn::prelude::Backend>(
     println!("  {:.1}s", t.elapsed().as_secs_f64());
 
     // --- audiovae.safetensors -------------------------------------------
+    // A pre-quantized checkpoint has the AudioVAE baked in.
+    let prequantized = checkpoint.manifest.is_some();
     let vae_path = dir.join("audiovae.safetensors");
-    if !vae_path.exists() {
+    if prequantized {
+        println!("audiovae: included in model.safetensors (pre-quantized checkpoint)");
+    } else if !vae_path.exists() {
         eprintln!(
             "\nmissing {}\nRun:\n  cargo run --release --example convert_audiovae \
              --no-default-features --features cpu -- {}",
@@ -384,6 +388,7 @@ fn run<Bk: burn::prelude::Backend>(
         );
         std::process::exit(1);
     }
+    if !prequantized {
     println!("streaming {}", vae_path.display());
     let t = std::time::Instant::now();
     let vae_src = FileSource::open(&vae_path).expect("open audiovae.safetensors");
@@ -402,6 +407,7 @@ fn run<Bk: burn::prelude::Backend>(
     model = m;
     weights::merge_apply_result(&mut acc, r);
     println!("  {:.1}s", t.elapsed().as_secs_f64());
+    }
 
     weights::finalize_apply_result(&mut acc);
     println!(

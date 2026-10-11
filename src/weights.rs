@@ -498,6 +498,47 @@ pub fn apply_tensor_group<B: Backend, M: ModuleSnapshot<B>>(
     )
 }
 
+/// A tensor ready to be handed to the module, already in the dtype the
+/// parameter should end up with.
+pub type PreparedTensor = (String, Vec<usize>, DType, Vec<u8>);
+
+/// Apply tensors that are already in their final form.
+///
+/// Unlike [`apply_tensor_group`] this does **no** remapping, no fusion, no
+/// dtype conversion and — crucially — applies no adapter. It is for a
+/// pre-quantized checkpoint, whose contents were exported from a loaded
+/// model and are therefore already remapped, already fused and already
+/// transposed. Running `PyTorchToBurnAdapter` over them would transpose
+/// every Linear weight a second time.
+///
+/// `DType::QFloat(..)` entries are passed through verbatim: burn's
+/// `from_data_dtype` routes them to `q_from_data`, so a quantized weight
+/// goes to the device without ever becoming a float tensor.
+pub fn apply_prepared_group<B: Backend, M: ModuleSnapshot<B>>(
+    model: &mut M,
+    label: &str,
+    tensors: Vec<PreparedTensor>,
+) -> Result<ApplyResult> {
+    let t = crate::compat::Stopwatch::start();
+    let mut snapshots: Vec<TensorSnapshot> = Vec::with_capacity(tensors.len());
+    for (name, shape, dtype, bytes) in tensors {
+        let data = burn::tensor::TensorData::from_bytes_vec(bytes, shape, dtype);
+        snapshots.push(TensorSnapshot::from_data(
+            data,
+            name.split('.').map(str::to_string).collect(),
+            Vec::new(),
+            ParamId::new(),
+        ));
+    }
+    let result = model.apply(snapshots, None, None, false);
+    log::debug!(
+        "weights[{}] apply (prepared, no adapter): {:.2}ms",
+        label,
+        t.elapsed_ms()
+    );
+    Ok(result)
+}
+
 fn apply_group_inner<B: Backend, M: ModuleSnapshot<B>>(
     model: &mut M,
     label: &str,

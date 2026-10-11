@@ -255,14 +255,55 @@ validates against it and fails. Fixing it means patching
 `cubek-matmul`'s strategy selection. `QuantPreset::Q4` exists and is
 refused with that explanation rather than silently falling back.
 
-### What this does *not* reduce
+### Pre-quantized checkpoints
 
-**The download is still 4.4 GB.** Quantization happens in the browser
-after the bytes arrive, so it cuts VRAM and inference time, not transfer.
-Cutting the download needs a pre-quantized checkpoint hosted somewhere —
-and at ~2.45 GB that cannot be GitHub Pages (1 GB site limit), so it
-would have to be a Hugging Face repo. The format and loader work is
-identical for Q8 and Q4, so doing it once covers both.
+Quantizing in the browser cuts VRAM and time but not the download — all
+4.37 GB still has to arrive first. Quantizing *offline* cuts both:
+
+```bash
+cargo run --release --example quantize_checkpoint \
+    --no-default-features --features wgpu -- \
+    /path/to/VoxCPM2 /path/to/VoxCPM2-q8 q8
+```
+
+Measured, loading the result instead of the upstream checkpoint:
+
+| | upstream | pre-quantized Q8 |
+| --- | --- | --- |
+| download | 4.27 GiB + 359 MB AudioVAE | **2.45 GiB, AudioVAE included** |
+| load time (native) | 30–35 s | **7.4 s** |
+| load time (browser) | 35.7 s | **9.1 s** |
+| GPU weights | 9.09 GB | 2.90 GB |
+| peak WASM heap | 2.0 GB | 1.4 GB |
+
+`applied=632, missing=0, unused=0, errors=0` either way, and the output
+passes the same speech checks.
+
+The format is plain safetensors, so the Range-streaming loader works
+unchanged. Quantized weights are stored as flat `U8` blobs holding
+exactly what `q_into_data` produced — packed values with the scales
+appended — and a manifest in `__metadata__` records each one's logical
+shape and the scheme. `q_from_data` consumes that layout directly, so
+loading never materializes a float copy. Everything left in floating
+point goes out at 16 bits.
+
+Two consequences worth knowing:
+
+- The file holds **final module paths**, exported from a loaded model, so
+  it is already remapped, fused and transposed. It must be applied
+  **without** `PyTorchToBurnAdapter`, or every Linear weight gets
+  transposed twice. The loader detects this from the manifest.
+- The AudioVAE is baked in, so there is no separate `audiovae.safetensors`
+  to fetch — which also removes the one file that had no public host.
+
+### Why the hosted demo still downloads 4.4 GB
+
+At 2.45 GiB a pre-quantized checkpoint **cannot go on GitHub Pages**,
+which caps a site at 1 GB. It needs a host that does CORS and Range —
+a Hugging Face repo works. Until one exists, point the page's *Base URL*
+at a directory containing a pre-quantized `model.safetensors` and it will
+detect and use it; `scripts/serve.py --model DIR --tailscale` is enough
+for your own machines.
 
 ## Switching between F32 and F16
 

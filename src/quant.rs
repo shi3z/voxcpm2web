@@ -289,3 +289,89 @@ pub fn quantize_linears<B: Backend, M: Module<B>>(
     let model = model.map(&mut mapper);
     (model, mapper.stats)
 }
+
+// ---------------------------------------------------------------------------
+// Pre-quantized checkpoints
+// ---------------------------------------------------------------------------
+//
+// Quantizing in the browser shrinks GPU residency but not the download: the
+// 4.37 GB still has to arrive before anything can be quantized. Quantizing
+// *offline* and shipping the result shrinks both.
+//
+// The format is plain safetensors so the existing Range-streaming loader
+// works unchanged. Quantized weights cannot be typed natively — safetensors
+// has no 4- or 8-bit quantized dtype — so each is stored as a flat `U8`
+// blob holding exactly what `q_into_data` produced (packed values with the
+// scales appended), and a manifest in `__metadata__` records the logical
+// shape and the scheme. `q_from_data` consumes that layout directly, so
+// loading never materializes a float copy.
+//
+// Names in the file are final module paths: the checkpoint is produced by
+// loading the upstream weights normally — remapped, fused, and transposed
+// by `PyTorchToBurnAdapter` — and then exporting. So it must be applied
+// **without** that adapter, or the Linear weights get transposed twice.
+
+/// What a pre-quantized checkpoint declares about itself.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QuantManifest {
+    /// Format version. Bumped if the layout changes.
+    pub version: u32,
+    /// The scheme every quantized tensor in the file uses.
+    pub scheme: QuantScheme,
+    /// Logical shape of each quantized tensor, keyed by module path. The
+    /// safetensors entry itself is a flat `U8` blob, so the real shape has
+    /// to be recorded here.
+    pub quantized: std::collections::BTreeMap<String, Vec<usize>>,
+}
+
+/// The `__metadata__` key the manifest lives under.
+pub const MANIFEST_KEY: &str = "voxcpm_quant";
+
+/// Current format version.
+pub const MANIFEST_VERSION: u32 = 1;
+
+impl QuantManifest {
+    /// Parse a manifest out of a safetensors `__metadata__` map.
+    ///
+    /// Returns `Ok(None)` for an ordinary, unquantized checkpoint.
+    pub fn from_metadata(
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> crate::Result<Option<Self>> {
+        let Some(raw) = metadata.get(MANIFEST_KEY) else {
+            return Ok(None);
+        };
+        let manifest: Self = serde_json::from_str(raw)?;
+        if manifest.version != MANIFEST_VERSION {
+            return Err(crate::Error::Unsupported(format!(
+                "pre-quantized checkpoint is format version {} but this build \
+                 understands {MANIFEST_VERSION}",
+                manifest.version
+            )));
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Serialize for storing in `__metadata__`.
+    pub fn to_json(&self) -> crate::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    /// Bytes a quantized tensor of this shape occupies in the file:
+    /// packed values plus its scales.
+    pub fn blob_len(&self, shape: &[usize]) -> usize {
+        let elems: usize = shape.iter().product();
+        let value_bits = self.scheme.value.size_bits();
+        let scales = match self.scheme.level {
+            QuantLevel::Tensor => 1,
+            QuantLevel::Block(b) => {
+                let block = b.num_elements().max(1);
+                elems.div_ceil(block)
+            }
+        };
+        let scale_bytes = match self.scheme.param {
+            burn::tensor::quantization::QuantParam::F32 => 4,
+            _ => 2,
+        };
+        elems * value_bits / 8 + scales * scale_bytes
+    }
+}

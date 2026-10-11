@@ -830,6 +830,13 @@ pub async fn load_model(
     p.stage("weights", &format!("reading header of {model_url}"));
     let src = HttpRangeSource::open(&model_url).await.map_err(to_js)?;
     let checkpoint = Checkpoint::open(&src).await.map_err(to_js)?;
+    let prequantized = checkpoint.manifest.is_some();
+    if prequantized {
+        p.stage(
+            "weights",
+            "pre-quantized checkpoint: smaller download, no separate AudioVAE",
+        );
+    }
     let (m, r) = stream::stream_into::<WebBackend, _, _, _>(
         model,
         &src,
@@ -846,6 +853,11 @@ pub async fn load_model(
     weights::merge_apply_result(&mut acc, r);
 
     // --- audiovae.safetensors --------------------------------------------
+    // A pre-quantized checkpoint was exported from a loaded model, so it
+    // already contains the AudioVAE; there is no second file to fetch.
+    if prequantized {
+        log::info!("AudioVAE is included in the pre-quantized checkpoint");
+    } else {
     // Small enough (359 MB) to hold whole, and its weight_norm pairs want
     // to be grouped anyway.
     let (vae_label, vae_bytes) = match audiovae_bytes {
@@ -896,6 +908,7 @@ pub async fn load_model(
     model = m;
     weights::merge_apply_result(&mut acc, r);
     drop(vae_src);
+    }
 
     // --- report -----------------------------------------------------------
     weights::finalize_apply_result(&mut acc);
@@ -937,9 +950,18 @@ pub async fn load_model(
         inner: VoxCPM::from_parts(model, tokenizer, &device),
         load_ms,
         resident_mib: survey.total_mib(),
-        quantization: match quantize {
-            Some(preset) => format!("{} bits (Linear)", preset.bits()),
-            None => "none".to_string(),
+        // Reported from the survey, not from what was requested: a
+        // pre-quantized checkpoint arrives quantized whatever the page
+        // asked for, and the request is then ignored.
+        quantization: if survey.quantized_tensors == 0 {
+            "none".to_string()
+        } else {
+            let bits = (survey.quantized_bytes * 8) / survey.quantized_params.max(1);
+            format!(
+                "{bits} bits across {} tensors{}",
+                survey.quantized_tensors,
+                if prequantized { " (from the checkpoint)" } else { " (applied on load)" }
+            )
         },
     })
 }

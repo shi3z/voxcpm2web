@@ -428,8 +428,9 @@ els.selftest.addEventListener('click', async () => {
       if (a.software) {
         say('WARNING: this is a software adapter. Correctness only — no timing here is meaningful.', 'error');
       }
-      const bytes = a.precision === 'f16' ? 4367.91 * 1048576 : 8735.82 * 1048576;
-      metric('m-gpu', `${fmtBytes(bytes)} of weights at ${a.precision}`);
+      // No estimate here: it cannot know whether the checkpoint is
+      // pre-quantized or what the page will ask for. "GPU weights
+      // (measured)" is filled in from a survey of the loaded model.
     }
     els.load.disabled = false;
     refreshHeap();

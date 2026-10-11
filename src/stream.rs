@@ -277,6 +277,10 @@ pub struct Checkpoint {
     pub data_start: u64,
     /// Total file size.
     pub file_size: u64,
+    /// Present when this is a pre-quantized checkpoint, in which case the
+    /// contents are already remapped, fused and transposed, and must be
+    /// applied without an adapter.
+    pub manifest: Option<crate::quant::QuantManifest>,
 }
 
 impl Checkpoint {
@@ -310,6 +314,17 @@ impl Checkpoint {
         let header_str = std::str::from_utf8(&header_bytes)
             .map_err(|e| Error::Other(format!("{}: header is not UTF-8: {e}", src.label())))?;
         let raw: HashMap<String, serde_json::Value> = serde_json::from_str(header_str)?;
+
+        // `__metadata__` is a string map, and carries the quantization
+        // manifest when there is one.
+        let manifest = match raw.get("__metadata__") {
+            Some(v) => {
+                let map: HashMap<String, String> = serde_json::from_value(v.clone())
+                    .map_err(|e| Error::Other(format!("{}: bad __metadata__: {e}", src.label())))?;
+                crate::quant::QuantManifest::from_metadata(&map)?
+            }
+            None => None,
+        };
 
         let data_start = 8 + header_len;
         let mut entries: Vec<TensorEntry> = Vec::with_capacity(raw.len());
@@ -360,10 +375,19 @@ impl Checkpoint {
             entries.len(),
             (file_size - data_start) as f64 / 1048576.0
         );
+        if let Some(m) = &manifest {
+            log::info!(
+                "{}: pre-quantized checkpoint ({:?}, {} quantized tensors)",
+                src.label(),
+                m.scheme.value,
+                m.quantized.len()
+            );
+        }
         Ok(Self {
             entries,
             data_start,
             file_size,
+            manifest,
         })
     }
 
@@ -528,6 +552,16 @@ where
     let mut acc = weights::empty_apply_result();
     let mut qstats = crate::quant::QuantStats::default();
     let mut quant_ms = 0.0f64;
+    // A pre-quantized checkpoint is already done; quantizing again would
+    // be wrong as well as wasteful.
+    let quantize = if checkpoint.manifest.is_some() {
+        if quantize.is_some() {
+            log::info!("{stage}: checkpoint is already quantized; ignoring the request");
+        }
+        None
+    } else {
+        quantize
+    };
 
     log::info!(
         "{stage}: {} tensors in {} batches, {:.2} MB source -> {:?} on GPU",
@@ -634,7 +668,87 @@ where
     S: ByteSource,
 {
     let tensors = read_batch(src, checkpoint, &batch.indices).await?;
-    weights::apply_tensor_group::<B, M>(model, &batch.label(), tensors, namespace)
+
+    match &checkpoint.manifest {
+        None => weights::apply_tensor_group::<B, M>(model, &batch.label(), tensors, namespace),
+        Some(manifest) => {
+            let prepared = prepare_prequantized::<B>(manifest, tensors)?;
+            weights::apply_prepared_group::<B, M>(model, &batch.label(), prepared)
+        }
+    }
+}
+
+/// Turn a batch of a pre-quantized checkpoint into tensors ready to apply.
+///
+/// Quantized entries are stored as flat `U8` blobs — safetensors has no
+/// quantized dtype — so the logical shape comes from the manifest and the
+/// bytes are passed through untouched for `q_from_data`. Everything else
+/// is float, stored at 16 bits to keep the file small, and is converted to
+/// whatever the backend wants so the model does not end up with mixed
+/// precision.
+fn prepare_prequantized<B: Backend>(
+    manifest: &crate::quant::QuantManifest,
+    tensors: Vec<RawTensor>,
+) -> Result<Vec<weights::PreparedTensor>> {
+    use burn::tensor::DType as BDType;
+
+    let target = weights::backend_float_dtype::<B>();
+    let mut out = Vec::with_capacity(tensors.len());
+
+    for (name, shape, dtype, bytes) in tensors {
+        match manifest.quantized.get(&name) {
+            Some(logical) => {
+                let want = manifest.blob_len(logical);
+                if bytes.len() != want {
+                    return Err(Error::Other(format!(
+                        "`{name}`: quantized blob is {} bytes, manifest implies {want}                          for shape {logical:?}",
+                        bytes.len()
+                    )));
+                }
+                out.push((
+                    name,
+                    logical.clone(),
+                    BDType::QFloat(manifest.scheme),
+                    bytes,
+                ));
+            }
+            None => {
+                let is_float = matches!(dtype, Dtype::F32 | Dtype::F16 | Dtype::BF16);
+                if is_float && dtype != target {
+                    let mut conv = vec![0u8; weights::converted_len(dtype, target, bytes.len())];
+                    weights::convert_float_slice(dtype, target, &bytes, &mut conv);
+                    out.push((name, shape, safetensors_to_burn_dtype(target)?, conv));
+                } else {
+                    out.push((name, shape, safetensors_to_burn_dtype(dtype)?, bytes));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn safetensors_to_burn_dtype(dt: Dtype) -> Result<burn::tensor::DType> {
+    use burn::tensor::DType as B;
+    Ok(match dt {
+        Dtype::F64 => B::F64,
+        Dtype::F32 => B::F32,
+        Dtype::F16 => B::F16,
+        Dtype::BF16 => B::BF16,
+        Dtype::I64 => B::I64,
+        Dtype::I32 => B::I32,
+        Dtype::I16 => B::I16,
+        Dtype::I8 => B::I8,
+        Dtype::U64 => B::U64,
+        Dtype::U32 => B::U32,
+        Dtype::U16 => B::U16,
+        Dtype::U8 => B::U8,
+        Dtype::BOOL => B::Bool,
+        other => {
+            return Err(Error::Unsupported(format!(
+                "safetensors dtype {other:?} has no burn equivalent"
+            )));
+        }
+    })
 }
 
 /// Read a batch's tensors, coalescing contiguous entries into single range
@@ -752,6 +866,7 @@ mod tests {
             entries,
             data_start: 0,
             file_size: offset,
+            manifest: None,
         };
 
         // A budget far smaller than one attention group: the group must
