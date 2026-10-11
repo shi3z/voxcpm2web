@@ -28,6 +28,7 @@ const els = {
   refStatus: $('ref-status'),
   modelUrl: $('model-url'),
   precision: $('precision'),
+  quantize: $('quantize'),
   sourcePreset: $('source-preset'),
   vaeUrl: $('vae-url'),
   vaeFile: $('vae-file'),
@@ -466,7 +467,13 @@ els.load.addEventListener('click', async () => {
   const sources = { base };
   if (vaeUrl) sources.audiovae = vaeUrl;
 
-  say(`loading model from ${base} — 4.4 GB streamed by HTTP Range, never held whole in WASM memory.`);
+  const q = els.quantize.value;
+  say(`loading model from ${base} — 4.4 GB streamed by HTTP Range, never held ` +
+      `whole in WASM memory.` +
+      (q === 'none'
+        ? ' No quantization: expect ~9.1 GB of VRAM.'
+        : ' Linear weights quantized to 8 bits as they land, so GPU residency' +
+          ' stays near 3.0 GB rather than peaking at 9.1 GB.'));
 
   const t0 = performance.now();
   let lastHeapCheck = 0;
@@ -490,6 +497,7 @@ els.load.addEventListener('click', async () => {
       vaeBytes || undefined,
       onProgress,
       undefined,
+      els.quantize.value,
     );
     // The bytes are on the GPU now; let the 359 MB copy go.
     vaeBytes = null;
@@ -497,7 +505,9 @@ els.load.addEventListener('click', async () => {
     sampleRate = session.sample_rate;
     const secs = (performance.now() - t0) / 1000;
     metric('m-load', `${secs.toFixed(1)} s`);
-    metric('m-precision', session.precision);
+    metric('m-precision', `${session.precision}, quantization: ${session.quantization}`);
+    // Measured off the loaded model, not estimated from the checkpoint.
+    metric('m-resident', `${(session.resident_mib / 1024).toFixed(2)} GB`);
     els.barFill.style.width = '100%';
     els.progressStage.textContent = 'ready';
     els.progressDetail.textContent = '';

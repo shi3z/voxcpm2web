@@ -57,6 +57,15 @@ use serde::Deserialize;
 use crate::weights::{self, Namespace, RawTensor};
 use crate::{Error, Result};
 
+/// Bytes per element for the backend's float dtype, used to state what
+/// the model would have cost unquantized.
+fn float_bytes_of(dt: Dtype) -> usize {
+    match dt {
+        Dtype::F32 => 4,
+        _ => 2,
+    }
+}
+
 /// Default per-batch budget of *source* bytes.
 ///
 /// Peak heap is roughly `budget` (raw) + `budget × dst/src` (converted) +
@@ -486,19 +495,26 @@ impl ProgressSink for LogProgress {
 /// Stream every tensor of `checkpoint` from `src` into `model`.
 ///
 /// Applies batch by batch, so peak WASM heap tracks `budget` rather than
-/// the checkpoint size. Returns the accumulated [`ApplyResult`]; the caller
+/// the checkpoint size.
+///
+/// Takes the module by value and hands it back, because `quantize` needs
+/// to consume it (`Module::map` does) once per batch.
+///
+/// Returns the module and the accumulated [`ApplyResult`]; the caller
 /// should pass it through [`crate::weights::finalize_apply_result`] once
 /// *all* sources have been loaded (each batch legitimately reports every
 /// parameter it does not itself carry as "missing").
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_into<B, M, S, P>(
-    model: &mut M,
+    mut model: M,
     src: &S,
     checkpoint: &Checkpoint,
     namespace: Namespace,
     budget: u64,
     stage: &str,
     progress: &P,
-) -> Result<ApplyResult>
+    quantize: Option<crate::quant::QuantPreset>,
+) -> Result<(M, ApplyResult)>
 where
     B: Backend,
     M: ModuleSnapshot<B>,
@@ -510,6 +526,8 @@ where
     let total = checkpoint.data_bytes();
     let mut done: u64 = 0;
     let mut acc = weights::empty_apply_result();
+    let mut qstats = crate::quant::QuantStats::default();
+    let mut quant_ms = 0.0f64;
 
     log::info!(
         "{stage}: {} tensors in {} batches, {:.2} MB source -> {:?} on GPU",
@@ -524,7 +542,8 @@ where
         progress.report(stage, done, total, &label);
 
         let t = crate::compat::Stopwatch::start();
-        let result = apply_batch::<B, M, S>(model, src, checkpoint, batch, namespace).await?;
+        let result =
+            apply_batch::<B, M, S>(&mut model, src, checkpoint, batch, namespace).await?;
         log::debug!(
             "{stage}: batch {}/{} `{label}` {:.2} MB in {:.0}ms",
             bi + 1,
@@ -534,11 +553,71 @@ where
         );
         weights::merge_apply_result(&mut acc, result);
 
+        // Quantize what just landed, before reading the next batch.
+        //
+        // Doing this per batch rather than once at the end is the whole
+        // point: a single pass afterwards would require the entire model
+        // in floating point first, peaking at 8.74 GB of GPU memory, and
+        // the reason to quantize at all is to never need that much.
+        // `quantize_linears` is idempotent, so earlier batches are skipped
+        // cheaply.
+        if let Some(preset) = quantize {
+            let t = crate::compat::Stopwatch::start();
+            // `Module::map` consumes the module, which is why this function
+            // owns it rather than borrowing: no placeholder, no unsafe.
+            let (quantized, stats) = crate::quant::quantize_linears::<B, M>(
+                model,
+                preset,
+                crate::quant::DEFAULT_MIN_ELEMS,
+            );
+            model = quantized;
+            qstats.add(stats);
+            quant_ms += t.elapsed_ms();
+        }
+
         done += batch.nbytes;
     }
 
+    if let Some(preset) = quantize {
+        // Report from a survey of the finished model, not from the
+        // per-batch tally: a pass only knows what it changed, so summing
+        // passes would count untouched parameters once per batch.
+        // Everything reported here is measured off the finished model.
+        // The per-pass tally is not used: `map_float` can see a parameter
+        // more than once per pass, so summing it overstates the work (it
+        // read 2x the surveyed figure on this model). The survey counts
+        // each parameter once and reads its real dtype.
+        let survey = crate::quant::survey::<B, M>(&model);
+        log::info!(
+            "{stage}: quantized to {} bits in {:.1}s — {} tensors quantized, \
+             {} left float",
+            preset.bits(),
+            quant_ms / 1000.0,
+            survey.quantized_tensors,
+            survey.float_tensors,
+        );
+        log::info!(
+            "{stage}: parameters resident: {:.0} MB ({:.0}M quantized + {:.0}M float). \
+             At {} bytes/param throughout this would be {:.0} MB.",
+            survey.total_mib(),
+            survey.quantized_params as f64 / 1e6,
+            survey.float_params as f64 / 1e6,
+            float_bytes_of(target_dtype),
+            (survey.quantized_params + survey.float_params) as f64
+                * float_bytes_of(target_dtype) as f64
+                / 1048576.0,
+        );
+        if qstats.unpackable > 0 {
+            log::warn!(
+                "{stage}: some Linear weights stay float because their last dimension \
+                 is not a multiple of {} and PackedU32 cannot pack them",
+                32 / preset.bits()
+            );
+        }
+    }
+
     progress.report(stage, total, total, "done");
-    Ok(acc)
+    Ok((model, acc))
 }
 
 /// Fetch, convert and apply one batch.

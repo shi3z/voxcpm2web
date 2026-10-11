@@ -113,6 +113,83 @@ mod track {
 #[global_allocator]
 static ALLOC: track::Tracking = track::Tracking;
 
+/// Quantize the big `Linear` weights in place, leaving everything else
+/// alone.
+///
+/// The point is to find out what 4-bit weights do to the *audio* before
+/// building an offline-quantization format and hosting a quantized
+/// checkpoint. Nothing about the model has to change: a `Tensor` can hold
+/// a quantized primitive, and burn's `matmul` dispatches to `q_matmul`,
+/// which dequantizes inside the kernel. So quantizing the parameters
+/// after loading is enough to measure the quality cost.
+///
+/// Two things are deliberately skipped:
+///
+/// * **Embeddings.** `q_gather` is `unimplemented!()` on this backend, so
+///   a quantized embedding panics at inference. It is also 301 MB of the
+///   4.37 GB, which is the floor this approach cannot go below.
+/// * **Anything not 2-D.** Convolutions (the AudioVAE) have no quantized
+///   kernel, and norm/scale parameters are 1-D and tiny.
+/// * **Tensors whose last dimension is not a multiple of 32/bits.**
+///   `QuantStore::PackedU32` packs 32/bits values into each u32 along the
+///   innermost dimension and panics with "Can't store in u32" otherwise.
+///   VoxCPM2 has such layers — the stop head projects to 2 classes — so
+///   this is a real constraint, not a theoretical one.
+struct QuantizeLinears {
+    scheme: burn::tensor::quantization::QuantScheme,
+    /// Container-type stack from `enter_module`, so `Struct:Linear` can be
+    /// targeted precisely instead of guessing from tensor shapes.
+    stack: Vec<String>,
+    min_elems: usize,
+    quantized: usize,
+    quantized_elems: usize,
+    skipped_elems: usize,
+    /// Linear weights big enough to be worth quantizing but whose last
+    /// dimension `PackedU32` cannot pack.
+    unpackable: usize,
+}
+
+impl<Bk: burn::prelude::Backend> burn::module::ModuleMapper<Bk> for QuantizeLinears {
+    fn enter_module(&mut self, _name: &str, container_type: &str) {
+        self.stack.push(container_type.to_string());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.stack.pop();
+    }
+
+    fn map_float<const D: usize>(
+        &mut self,
+        param: burn::module::Param<burn::prelude::Tensor<Bk, D>>,
+    ) -> burn::module::Param<burn::prelude::Tensor<Bk, D>> {
+        let in_linear = self.stack.iter().any(|c| c == "Struct:Linear");
+        let (id, tensor, mapper) = param.consume();
+        let dims = tensor.shape().dims;
+        let elems: usize = tensor.shape().num_elements();
+        // PackedU32 packs this many values into each u32, along the
+        // innermost dimension, and requires that dimension to divide
+        // evenly.
+        let per_u32 = 32 / self.scheme.value.size_bits();
+        let packable = dims
+            .last()
+            .map(|last| last % per_u32 == 0)
+            .unwrap_or(false);
+
+        if D == 2 && in_linear && elems >= self.min_elems && packable {
+            self.quantized += 1;
+            self.quantized_elems += elems;
+            let q = tensor.quantize_dynamic(&self.scheme);
+            burn::module::Param::from_mapped_value(id, q, mapper)
+        } else {
+            if D == 2 && in_linear && elems >= self.min_elems && !packable {
+                self.unpackable += 1;
+            }
+            self.skipped_elems += elems;
+            burn::module::Param::from_mapped_value(id, tensor, mapper)
+        }
+    }
+}
+
 /// Peak resident set size in MB, from `/proc/self/status`.
 fn peak_rss_mb() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -137,6 +214,7 @@ fn main() {
     let mut use_async = false;
     let mut use_stream = false;
     let mut use_f16 = false;
+    let mut quant: Option<String> = None;
     let mut max_len: Option<usize> = None;
     let mut argv = std::env::args().skip(1);
     while let Some(a) = argv.next() {
@@ -147,6 +225,7 @@ fn main() {
             "--max-len" => max_len = argv.next().and_then(|v| v.parse().ok()),
             "--async" => use_async = true,
             "--f16" => use_f16 = true,
+            "--quant" => quant = argv.next(),
             "--stream" => {
                 use_stream = true;
                 use_async = true;
@@ -160,7 +239,10 @@ fn main() {
                      --stream  drive it through `GenerateStream::next_chunk_async`,\n\
                      \x20         the browser's streaming path; reports time-to-first-audio.\n\
                      --f16     run with f16 weights, matching the browser's\n\
-                     \x20         `webgpu-f16` build instead of the default f32.\n\n\
+                     \x20         `webgpu-f16` build instead of the default f32.\n\
+                     --quant S quantize Linear weights after loading, to measure\n\
+                     \x20         what it costs the audio. S is q8, q4, q4b32,\n\
+                     \x20         q4b64 or q4b128.\n\n\
                      Requires audiovae.safetensors — run the convert_audiovae example first."
                 );
                 return;
@@ -183,9 +265,9 @@ fn main() {
     let budget = budget_mb * 1024 * 1024;
 
     if use_f16 {
-        run::<BF16>(&dir, &text, &out, budget, use_async, use_stream, max_len, "f16");
+        run::<BF16>(&dir, &text, &out, budget, use_async, use_stream, max_len, "f16", quant);
     } else {
-        run::<B>(&dir, &text, &out, budget, use_async, use_stream, max_len, "f32");
+        run::<B>(&dir, &text, &out, budget, use_async, use_stream, max_len, "f32", quant);
     }
 }
 
@@ -201,8 +283,27 @@ fn run<Bk: burn::prelude::Backend>(
     use_stream: bool,
     max_len: Option<usize>,
     precision: &str,
+    quant: Option<String>,
 ) {
     println!("element type: {precision}");
+    let preset = match quant.as_deref() {
+        None => None,
+        Some(spec) => match voxcpm_rs::quant::QuantPreset::parse(spec) {
+            Some(p) => {
+                println!("quantization: {spec} ({} bits per Linear weight)", p.bits());
+                if !p.is_supported() {
+                    println!(
+                        "  note: {p:?} is not known to run inference on this model yet"
+                    );
+                }
+                Some(p)
+            }
+            None => {
+                eprintln!("unknown --quant `{spec}` (q8|q4|q4b32|q4b64|q4b128)");
+                std::process::exit(2);
+            }
+        },
+    };
 
     let device = Default::default();
     let t_total = std::time::Instant::now();
@@ -257,16 +358,18 @@ fn run<Bk: burn::prelude::Backend>(
             .unwrap_or_default()
     );
 
-    let r = stream::block_on_ready(stream::stream_into::<Bk, _, _, _>(
-        &mut model,
+    let (m, r) = stream::block_on_ready(stream::stream_into::<Bk, _, _, _>(
+        model,
         &src,
         &checkpoint,
         Namespace::Model,
         budget,
         "weights",
         &LogProgress,
+        preset,
     ))
     .expect("stream model weights");
+    model = m;
     weights::merge_apply_result(&mut acc, r);
     println!("  {:.1}s", t.elapsed().as_secs_f64());
 
@@ -285,16 +388,18 @@ fn run<Bk: burn::prelude::Backend>(
     let t = std::time::Instant::now();
     let vae_src = FileSource::open(&vae_path).expect("open audiovae.safetensors");
     let vae_checkpoint = stream::block_on_ready(Checkpoint::open(&vae_src)).expect("parse vae header");
-    let r = stream::block_on_ready(stream::stream_into::<Bk, _, _, _>(
-        &mut model,
+    let (m, r) = stream::block_on_ready(stream::stream_into::<Bk, _, _, _>(
+        model,
         &vae_src,
         &vae_checkpoint,
         Namespace::AudioVae,
         budget,
         "audiovae",
         &LogProgress,
+        None,
     ))
     .expect("stream audiovae weights");
+    model = m;
     weights::merge_apply_result(&mut acc, r);
     println!("  {:.1}s", t.elapsed().as_secs_f64());
 

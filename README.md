@@ -178,6 +178,92 @@ for correctness testing.
 
 ---
 
+## Quantization
+
+`Linear` weights are quantized to **8 bits by default**, which is what
+makes this runnable on ordinary hardware. It is a runtime choice in the
+page (*Weight quantization*), not a build flag.
+
+| | GPU weights | notes |
+| --- | --- | --- |
+| **Q8** *(default)* | **2.97 GB** | measured; ~2× faster than F32 |
+| none (F32) | 9.09 GB | exact; needs a 12 GB card |
+
+Measured on an RTX 4090, same text, `--async`:
+
+```
+Q8    2974 MB resident (2139M params quantized + 245M float)   RTF 10.7
+F32   9095 MB                                                  RTF 13–20
+```
+
+Output stays speech. Against the F32 baseline on identical text, both
+pass the pitch and syllable-rate checks in `scripts/`:
+
+| | duration | voiced | median F0 | syllables/s |
+| --- | --- | --- | --- | --- |
+| F32 | 6.08 s | 57.0 % | 186 Hz | 2.8 |
+| Q8 | 6.08 s | 82.8 % | 222 Hz | 5.8 |
+
+Those are different trajectories, not a degradation metric — an
+autoregressive sampler diverges from any perturbation. **Nobody has
+listened to the Q8 output and compared it by ear**, which is the
+judgement that actually matters; the numbers only establish that it is
+still speech with healthy amplitude and no NaN.
+
+### How it works, and why during the load
+
+Nothing in the model changes. A burn `Tensor` can hold a quantized
+primitive, `matmul` dispatches to `q_matmul`, and that dequantizes inside
+the kernel instead of materializing a float copy. So quantization is just
+a transform over parameters.
+
+It runs **as each batch of weights lands**, not once at the end. A single
+pass afterwards would need the whole model in floating point first,
+peaking at 9.1 GB — exactly what quantization is for avoiding.
+
+Left in floating point, deliberately:
+
+- **Embeddings** (73448 × 2048 = 301 MB). `q_gather` is
+  `unimplemented!()` on this backend, so a quantized embedding panics at
+  inference. This is the floor the approach cannot go below.
+- **Convolutions** (the AudioVAE) — no quantized convolution kernel.
+- **Norm and scale parameters** — 1-D and negligible.
+- **Anything whose last dimension is not a multiple of `32/bits`.**
+  `QuantStore::PackedU32` packs that many values per `u32` along the
+  innermost axis and panics otherwise. VoxCPM2 has such a layer: the stop
+  head projects to 2 classes.
+
+The self-test probes a Q8 matmul, so a device that cannot do it says so
+in seconds rather than after a 4.4 GB download. Verified in-browser on
+SwiftShader, which reports only 32 KB of workgroup storage — the
+tightest limit available here.
+
+### Q4 does not work yet
+
+Q4 would put the checkpoint at ~1.45 GB. The quantization itself
+succeeds; inference does not:
+
+```
+cubek-matmul auto(): SimpleCyclicCmma -> Unavailable (no cooperative matrix on WebGPU)
+                   -> falls back to SimpleUnit
+                   -> needs 98304 bytes of shared memory, limit is 49152
+                   -> unwraps the error instead of trying a smaller tile
+```
+
+The tile selection does not consult `max_shared_memory_size`; it
+validates against it and fails. Fixing it means patching
+`cubek-matmul`'s strategy selection. `QuantPreset::Q4` exists and is
+refused with that explanation rather than silently falling back.
+
+### What this does *not* reduce
+
+**The download is still 4.4 GB.** Quantization happens in the browser
+after the bytes arrive, so it cuts VRAM and inference time, not transfer.
+Cutting the download needs a pre-quantized checkpoint hosted somewhere —
+and at ~2.45 GB that cannot be GitHub Pages (1 GB site limit), so it
+would have to be a Hugging Face repo. The format and loader work is
+identical for Q8 and Q4, so doing it once covers both.
+
 ## Switching between F32 and F16
 
 Precision is a **build-time** switch: `B::FloatElem` is a type parameter,

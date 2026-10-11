@@ -47,6 +47,7 @@ pub mod fsq;
 pub mod locdit;
 pub mod locenc;
 pub mod minicpm4;
+pub mod quant;
 pub mod stream;
 pub mod tokenizer;
 pub mod voxcpm2;

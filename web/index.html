@@ -33,6 +33,13 @@
       </select>
     </label>
     <label class="field">
+      <span>Weight quantization</span>
+      <select id="quantize">
+        <option value="q8">Q8 (default) — Linear weights to 8 bits: ~3.0 GB of VRAM instead of ~9.1 GB, and faster</option>
+        <option value="none">None — exact F32, ~9.1 GB of VRAM. Needs a 12 GB card</option>
+      </select>
+    </label>
+    <label class="field">
       <span>Weights source</span>
       <select id="source-preset">
         <option value="local">Local server (/models) — needs scripts/serve.py</option>
@@ -139,6 +146,7 @@
       <tbody>
         <tr><th>WebGPU adapter</th><td id="m-adapter">—</td></tr>
         <tr><th>Weight precision</th><td id="m-precision">—</td></tr>
+        <tr><th>GPU weights (measured)</th><td id="m-resident">—</td></tr>
         <tr><th>Model load time</th><td id="m-load">—</td></tr>
         <tr><th>Generation time</th><td id="m-gen">—</td></tr>
         <tr><th>Time to first audio</th><td id="m-ttfa">—</td></tr>

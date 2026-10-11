@@ -552,10 +552,65 @@ pub async fn webgpu_self_test() -> Result<String, JsValue> {
         ));
     }
 
+    // Can this device do a quantized matmul? Worth answering here, in
+    // seconds, rather than after a 4.4 GB download: the Q8 path needs
+    // kernels that ask for shared memory, and the limit varies a lot
+    // (49152 bytes on a discrete GPU, 32768 on SwiftShader).
+    {
+        use crate::quant::QuantPreset;
+        let n = 256usize;
+        let a = Tensor::<WebBackend, 2>::ones([n, n], &device);
+        let w = Tensor::<WebBackend, 2>::eye(n, &device).mul_scalar(2.0);
+        let scheme = QuantPreset::Q8.scheme();
+
+        let probe = async {
+            let wq = w.clone().quantize_dynamic(&scheme);
+            a.clone().matmul(wq).into_data_async().await
+        }
+        .await;
+
+        match probe {
+            Err(e) => {
+                failures += 1;
+                report.push(format!(
+                    "  {:<28} {:>12}   FAIL ({e:?})",
+                    "q8 matmul", "-"
+                ));
+            }
+            Ok(data) => match data.convert::<f32>().into_vec::<f32>() {
+                Err(_) => {
+                    failures += 1;
+                    report.push(format!(
+                        "  {:<28} {:>12}   FAIL (dtype)",
+                        "q8 matmul", "-"
+                    ));
+                }
+                Ok(v) => {
+                    let peak = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+                    // Identity * 2 against ones: every element should be 2.
+                    let bad = v.iter().filter(|x| (**x - 2.0).abs() > 0.1).count();
+                    if bad == 0 {
+                        report.push(format!(
+                            "  {:<28} {peak:>12.4}   ok",
+                            "q8 matmul (expect 2.0)"
+                        ));
+                    } else {
+                        failures += 1;
+                        report.push(format!(
+                            "  {:<28} {peak:>12.4}   FAIL, {bad}/{} elements off",
+                            "q8 matmul (expect 2.0)",
+                            v.len()
+                        ));
+                    }
+                }
+            },
+        }
+    }
+
     let body = format!(
         "WebGPU available\nadapter: {adapter}\nprecision: {PRECISION}\n\n\
          matrix test: PASS ({n}x{n} matmul, sum={sum})\n\n\
-         reduce tests:\n{}",
+         reduce and quantization tests:\n{}",
         report.join("\n")
     );
 
@@ -625,6 +680,10 @@ impl JsProgress {
 pub struct VoxCpmSession {
     inner: VoxCPM<WebBackend>,
     load_ms: f64,
+    /// Measured parameter bytes resident on the GPU, in MiB.
+    resident_mib: f64,
+    /// What quantization ended up being used.
+    quantization: String,
 }
 
 /// Where each checkpoint file comes from.
@@ -704,9 +763,34 @@ pub async fn load_model(
     audiovae_bytes: Option<js_sys::Uint8Array>,
     progress: Option<js_sys::Function>,
     batch_budget_bytes: Option<f64>,
+    quantize: Option<String>,
 ) -> Result<VoxCpmSession, JsValue> {
     let t_total = crate::compat::Stopwatch::start();
     let p = JsProgress { callback: progress };
+
+    // Weight-only quantization of the Linear layers, applied as each batch
+    // lands rather than afterwards — a single pass at the end would need
+    // the whole model in floating point first, which is the thing being
+    // avoided.
+    let quantize = match quantize.as_deref() {
+        None | Some("") | Some("none") => None,
+        Some(spec) => match crate::quant::QuantPreset::parse(spec) {
+            Some(preset) if preset.is_supported() => Some(preset),
+            Some(preset) => {
+                return Err(err(format!(
+                    "quantization `{spec}` ({preset:?}) does not currently run this \
+                     model. cubek-matmul's fallback strategy asks for more shared \
+                     memory than the hardware allows and does not retry smaller. \
+                     Use `q8`, or none for exact F32."
+                )));
+            }
+            None => {
+                return Err(err(format!(
+                    "unknown quantization `{spec}` (expected none or q8)"
+                )));
+            }
+        },
+    };
     let sources: ModelSources = serde_json::from_str(&sources_json)
         .map_err(|e| err(format!("bad model sources JSON: {e}")))?;
     let budget = batch_budget_bytes
@@ -746,17 +830,19 @@ pub async fn load_model(
     p.stage("weights", &format!("reading header of {model_url}"));
     let src = HttpRangeSource::open(&model_url).await.map_err(to_js)?;
     let checkpoint = Checkpoint::open(&src).await.map_err(to_js)?;
-    let r = stream::stream_into::<WebBackend, _, _, _>(
-        &mut model,
+    let (m, r) = stream::stream_into::<WebBackend, _, _, _>(
+        model,
         &src,
         &checkpoint,
         Namespace::Model,
         budget,
         "weights",
         &p,
+        quantize,
     )
     .await
     .map_err(to_js)?;
+    model = m;
     weights::merge_apply_result(&mut acc, r);
 
     // --- audiovae.safetensors --------------------------------------------
@@ -793,17 +879,21 @@ pub async fn load_model(
     };
     let vae_src = MemorySource::new(&vae_label, vae_bytes);
     let vae_checkpoint = Checkpoint::open(&vae_src).await.map_err(to_js)?;
-    let r = stream::stream_into::<WebBackend, _, _, _>(
-        &mut model,
+    // The AudioVAE is convolutional, so there is nothing for the
+    // quantizer to do there; pass `None` rather than walk the tree.
+    let (m, r) = stream::stream_into::<WebBackend, _, _, _>(
+        model,
         &vae_src,
         &vae_checkpoint,
         Namespace::AudioVae,
         budget,
         "audiovae",
         &p,
+        None,
     )
     .await
     .map_err(to_js)?;
+    model = m;
     weights::merge_apply_result(&mut acc, r);
     drop(vae_src);
 
@@ -835,9 +925,22 @@ pub async fn load_model(
         acc.applied.len()
     );
 
+    let survey = crate::quant::survey::<WebBackend, _>(&model);
+    log::info!(
+        "parameters resident: {:.0} MB ({} quantized tensors, {} float)",
+        survey.total_mib(),
+        survey.quantized_tensors,
+        survey.float_tensors,
+    );
+
     Ok(VoxCpmSession {
         inner: VoxCPM::from_parts(model, tokenizer, &device),
         load_ms,
+        resident_mib: survey.total_mib(),
+        quantization: match quantize {
+            Some(preset) => format!("{} bits (Linear)", preset.bits()),
+            None => "none".to_string(),
+        },
     })
 }
 
@@ -853,6 +956,21 @@ impl VoxCpmSession {
     #[wasm_bindgen(getter)]
     pub fn load_ms(&self) -> f64 {
         self.load_ms
+    }
+
+    /// Measured parameter bytes resident on the GPU, in MiB.
+    ///
+    /// Counted off the loaded model one parameter at a time, reading each
+    /// tensor's real dtype — not estimated from the checkpoint.
+    #[wasm_bindgen(getter)]
+    pub fn resident_mib(&self) -> f64 {
+        self.resident_mib
+    }
+
+    /// The quantization actually in effect.
+    #[wasm_bindgen(getter)]
+    pub fn quantization(&self) -> String {
+        self.quantization.clone()
     }
 
     /// The float precision the weights are resident in on the GPU —
