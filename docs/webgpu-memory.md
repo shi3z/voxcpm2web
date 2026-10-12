@@ -145,6 +145,13 @@ only ever grows — it is the high-water mark including allocator
 fragmentation, and it is never returned. It is the number that has to fit
 under 4 GB, and it does, with F16 roughly halving it.
 
+Being a growth mark rather than a measurement, it is **not
+deterministic**: three loads of the pre-quantized Q8 checkpoint reserved
+1.4 GB, 1.4 GB and 2.0 GB, differing only in where the bytes came from
+and therefore in the timing and interleaving of allocations. Treat any
+single reading as "under 2 GB", not as a figure to compare against
+another run.
+
 Native RSS for the same run reads ~10 GB, but that is misleading: it
 counts the GPU driver's host-side mappings of the 8.7 GB of device
 memory, which in a browser never touch the WASM heap. Hence the tracking

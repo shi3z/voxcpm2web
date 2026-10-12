@@ -92,23 +92,27 @@ Hugging Face, both sources verified this way:
 
 | source | size | load | result |
 | --- | --- | --- | --- |
-| `shi3z/VoxCPM2-q8` *(default)* | 2.45 GiB | 465 s | `applied=632, missing=0, unused=0, errors=0`, 2.90 GB on the GPU |
+| `shi3z/VoxCPM2-q8` *(default)* | 2.45 GiB | 186 s | `applied=632, missing=0, unused=0, errors=0`, 2.90 GB on the GPU |
 | `openbmb/VoxCPM2` | 4.4 GB | 474 s | `applied=632, missing=0, unused=0, errors=0` |
 
-Both of those are bandwidth, not compute — the two runs happened to hit
-similar wall-clock times at different link speeds, so read them as "a few
-minutes on a home connection" rather than as a comparison. There is no
-local cache yet, so a reload re-downloads.
+The first row is the **deployed** page at the URL above, driven headless,
+pulling from Hugging Face cross-origin — so the preflight, the deployed
+`wasm-opt`ed bundle and the manifest detection are all covered by it.
 
-The AudioVAE *is* small enough for Pages: ~359 MB plus ~23 MB of wasm
-sits well inside the 1 GB site limit, and it is still deployed for the
-optional full-precision source.
+Those times are bandwidth, not compute: the same default source measured
+465 s on a slower link an hour earlier. Read them as "a few minutes on a
+home connection", not as a benchmark. There is no local cache yet, so a
+reload re-downloads.
+
+The AudioVAE *is* small enough for Pages: ~359 MB alongside two 10.8 MB
+wasm bundles sits well inside the 1 GB site limit, and it is still
+deployed for the optional full-precision source.
 
 The default source no longer touches it, which is what makes the hosted
-demo cheap to run: a default visit pulls **~23 MB of wasm** from Pages
-and everything else from Hugging Face. Against Pages' ~100 GB/month soft
-bandwidth cap that is thousands of loads rather than the ~250 a month
-the 359 MB AudioVAE allowed.
+demo cheap to run: a default visit pulls **~11 MB** from Pages — one
+wasm bundle and the page — and everything else from Hugging Face.
+Against Pages' ~100 GB/month soft bandwidth cap that is thousands of
+loads rather than the ~250 a month the 359 MB AudioVAE allowed.
 
 ### Feeding your own weights instead
 
@@ -139,7 +143,8 @@ on a machine only you can reach.
 | --- | --- |
 | Compiles for `wasm32-unknown-unknown` | yes, with all native backends still building |
 | WebGPU compute in-browser | verified — 64×64 matmul and a reduce through Burn/cubecl |
-| Checkpoint loading in-browser | verified — 4.37 GB streamed by HTTP Range, `applied=632, missing=0, errors=0`, 35.7 s |
+| Checkpoint loading in-browser | verified — both sources streamed by HTTP Range, `applied=632, missing=0, errors=0`: 2.45 GiB pre-quantized in 9.1 s, 4.37 GB full precision in 35.7 s (local server) |
+| The deployed demo end to end | verified — self-test and a full load from Hugging Face, on the published bundle |
 | Speech generation in-browser | verified — finite PCM at the correct length |
 | Agreement with native | **correlation 1.000000**, max difference 0.04 % of peak |
 | Browser UI | works: self-test, load, generate, play, save, voice cloning, streaming |
@@ -314,10 +319,20 @@ Measured, loading the result instead of the upstream checkpoint:
 | load time (browser) | 35.7 s | **9.1 s** |
 | GPU weights | 9.09 GB | 2.90 GB |
 | peak GPU, generation included | 9.65 GiB | **5.22 GiB** |
-| peak WASM heap | 2.0 GB | 1.4 GB |
+| peak WASM heap | 2.0 GB | 1.4–2.0 GB (see below) |
 
 `applied=632, missing=0, unused=0, errors=0` either way, and the output
 passes the same speech checks.
+
+The WASM heap row deserves the hedge. `WebAssembly.Memory` only ever
+grows, so what the page reports is a high-water mark including allocator
+fragmentation — and that mark is not deterministic. Three loads of this
+same pre-quantized checkpoint reserved 1.4 GB, 1.4 GB and **2.0 GB**,
+the 2.0 GB being the deployed bundle pulling from Hugging Face. So
+pre-quantizing does not reliably reduce the WASM high-water mark; it
+reduces the download, the load time and the GPU footprint. The heap
+number that matters is that it stays well under the 4 GB address-space
+limit, which it does in every run.
 
 The format is plain safetensors, so the Range-streaming loader works
 unchanged. Quantized weights are stored as flat `U8` blobs holding
