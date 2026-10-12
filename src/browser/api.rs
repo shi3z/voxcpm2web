@@ -956,7 +956,7 @@ pub async fn load_model(
         quantization: if survey.quantized_tensors == 0 {
             "none".to_string()
         } else {
-            let bits = (survey.quantized_bytes * 8) / survey.quantized_params.max(1);
+            let bits = survey.bits_per_quantized_param();
             format!(
                 "{bits} bits across {} tensors{}",
                 survey.quantized_tensors,

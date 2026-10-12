@@ -73,6 +73,16 @@ let vaeBytes = null;    // AudioVAE supplied from a local file, if any
 // Hugging Face serves Range requests with CORS — so the page and the
 // weights can live in different places.
 const SOURCE_PRESETS = {
+  // Pre-quantized INT8, exported from an already-loaded model, with the
+  // AudioVAE merged in: one 2.45 GiB download instead of 4.37 GB + 359 MB,
+  // and no full-precision tensor ever exists on the GPU. That last part is
+  // what makes an 8 GB card enough — measured peak 5.22 GiB, generation
+  // included, against 9.65 GiB for the full-precision checkpoint.
+  'hf-q8': {
+    base: 'https://huggingface.co/shi3z/VoxCPM2-q8/resolve/main',
+    vae: '',
+    prequantized: true,
+  },
   local: {
     base: '/models',
     vae: '/models/audiovae.safetensors',
@@ -87,6 +97,12 @@ const SOURCE_PRESETS = {
     vae: '',
   },
 };
+
+// True when the selected preset points at a checkpoint that already
+// contains quantized weights and the AudioVAE, so the page must not ask
+// for a separate AudioVAE.
+const presetIsPrequantized = () =>
+  !!SOURCE_PRESETS[els.sourcePreset.value]?.prequantized;
 
 // Set once at boot: the site's own AudioVAE, if it has one.
 let siteAudioVae = '';
@@ -339,7 +355,20 @@ function applySourcePreset() {
   const p = SOURCE_PRESETS[els.sourcePreset.value];
   if (!p) return;
   els.modelUrl.value = p.base;
-  els.vaeUrl.value = p.vae || siteAudioVae;
+  // A pre-quantized checkpoint carries the AudioVAE, so leaving a URL in
+  // the box would make the loader fetch 359 MB it will then ignore.
+  els.vaeUrl.value = p.prequantized ? '' : (p.vae || siteAudioVae);
+  $('vae-details').hidden = !!p.prequantized;
+  // The checkpoint's own dtype decides; the loader logs that it is
+  // ignoring the request. Greying the control out says so before the
+  // click rather than after.
+  els.quantize.disabled = !!p.prequantized;
+  if (p.prequantized) {
+    say('pre-quantized INT8 checkpoint: 2.45 GiB, AudioVAE included, nothing ' +
+        'for you to supply. Weights land on the GPU already quantized, so this ' +
+        'is the configuration that fits an 8 GB card.');
+    return;
+  }
   if (els.sourcePreset.value === 'hf' && !vaeBytes && !els.vaeUrl.value) {
     // Open the section, because this is the one thing the user has to do.
     $('vae-details').open = true;
@@ -452,7 +481,8 @@ els.load.addEventListener('click', async () => {
 
   const base = els.modelUrl.value.trim() || '/models';
   const vaeUrl = els.vaeUrl.value.trim();
-  if (!vaeBytes && !vaeUrl) {
+  const prequantized = presetIsPrequantized();
+  if (!prequantized && !vaeBytes && !vaeUrl) {
     els.load.disabled = false;
     say('no AudioVAE source. Three ways to fix it, under "AudioVAE source":\n' +
         '  1. Select your converted audiovae.safetensors (read in this tab, ' +
@@ -469,12 +499,26 @@ els.load.addEventListener('click', async () => {
   if (vaeUrl) sources.audiovae = vaeUrl;
 
   const q = els.quantize.value;
-  say(`loading model from ${base} — 4.4 GB streamed by HTTP Range, never held ` +
-      `whole in WASM memory.` +
-      (q === 'none'
-        ? ' No quantization: expect ~9.1 GB of VRAM.'
-        : ' Linear weights quantized to 8 bits as they land, so GPU residency' +
-          ' stays near 3.0 GB rather than peaking at 9.1 GB.'));
+  if (prequantized) {
+    say(`loading model from ${base} — 2.45 GiB streamed by HTTP Range, never ` +
+        `held whole in WASM memory. Already INT8, so the weight quantization ` +
+        `setting above does not apply and no full-precision tensor is ever ` +
+        `allocated: ~2.9 GB resident, 5.2 GiB peak with generation.`);
+  } else {
+    // Only the full-precision Hugging Face preset has a size this page can
+    // state up front. A local directory may hold either kind — the loader
+    // reads the header and says which — so do not put a number on it, and
+    // describe the quantization setting as the request it is.
+    const size = els.sourcePreset.value === 'hf' ? ' 4.4 GB,' : '';
+    say(`loading model from ${base} —${size} streamed by HTTP Range, never held ` +
+        `whole in WASM memory.` +
+        (q === 'none'
+          ? ' Quantization off: a full-precision checkpoint then needs ~9.1 GB' +
+            ' of VRAM, so a 12 GB card.'
+          : ' Linear weights will be quantized to 8 bits as they land, unless' +
+            ' the checkpoint turns out to be quantized already — either way GPU' +
+            ' residency ends near 3.0 GB rather than 9.1 GB.'));
+  }
 
   const t0 = performance.now();
   let lastHeapCheck = 0;
@@ -818,14 +862,14 @@ const hasSiteAudioVae = () => probe('audiovae.safetensors');
   if (siteVae) {
     siteAudioVae = 'audiovae.safetensors';
   }
-  els.sourcePreset.value = local ? 'local' : 'hf';
+  // Default to the pre-quantized checkpoint: smallest download, lowest VRAM,
+  // nothing for the visitor to supply. A local checkpoint still wins, since
+  // whoever started serve.py meant to use it.
+  els.sourcePreset.value = local ? 'local' : 'hf-q8';
   applySourcePreset();
   if (local) {
     say('found a checkpoint at /models on this server, so using it instead of ' +
-        'downloading 4.4 GB from Hugging Face.');
-  } else if (siteVae) {
-    say('weights stream from Hugging Face; the AudioVAE is served with this ' +
-        'page. Nothing for you to supply — just Load model.');
+        'downloading from Hugging Face.');
   }
   boot();
 })();

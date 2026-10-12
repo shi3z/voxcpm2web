@@ -71,10 +71,38 @@ length (~0.2 MB/s of audio at F32). Not a factor at these scales.
 
 ### Measured total
 
-Nothing in WebGPU reports process-wide GPU usage, so the honest statement
-is: weights dominate, and the table in §1 is the number to plan around.
-`maxBufferSize` / `maxStorageBufferBindingSize` *are* reported and are
-surfaced in the demo's Diagnostics panel.
+Nothing in WebGPU reports process-wide GPU usage, so the browser cannot
+tell you its own peak. `maxBufferSize` / `maxStorageBufferBindingSize`
+*are* reported and are surfaced in the demo's Diagnostics panel.
+
+The peak can be measured from outside, though, on the native backend
+that shares this code. Polling `nvidia-smi` for the process's own
+allocation across a whole run — module construction, weight load, and one
+generation of 「これは八ギガバイトで動くかどうかの確認です。」 — gives:
+
+| configuration | resident weights | **peak GPU** | fits 8 GB? |
+| --- | --- | --- | --- |
+| pre-quantized Q8 | 2.90 GB | **5343 MiB (5.22 GiB)** | yes |
+| upstream, Q8 applied during load | 2.97 GB | **5878 MiB (5.74 GiB)** | yes |
+| upstream, unquantized F32 | 9.09 GB | **9883 MiB (9.65 GiB)** | no — wants 12 GB |
+
+Three things worth reading off that table:
+
+1. **Quantizing during load does not need the full-precision footprint.**
+   The naive fear — that `VoxCpm2Model::new` materializes 9 GB of
+   randomly-initialized F32 parameters before the first weight arrives —
+   does not happen. Parameters are replaced group by group as they land,
+   and the transient float copy is bounded by the batch budget (64 MiB by
+   default), so the on-load path peaks 535 MiB above the pre-quantized
+   one rather than 4 GB above it.
+
+2. **The gap between the two Q8 rows is transfer, not memory.** 2.45 GiB
+   against 4.37 GB, and 7.4 s against 30–35 s to load natively.
+
+3. **Peak exceeds resident weights by ~2.4 GB in every row.** That is the
+   wgpu device, the compiled pipelines, the KV cache and the activation
+   high-water mark of §§ *KV cache* and *Activations* above — which is
+   why "2.9 GB of weights" is not the number to size a card against.
 
 ---
 

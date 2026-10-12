@@ -141,10 +141,12 @@ jobs:
       - name: Warn if the AudioVAE is missing
         if: steps.audiovae.outcome != 'success'
         run: |
-          echo "::warning title=AudioVAE missing::Converting audiovae.pth failed, \
-          so the deployed page will not be self-contained: visitors will be asked \
-          to supply audiovae.safetensors themselves. Re-run this workflow once \
-          Hugging Face is reachable."
+          echo "::warning title=AudioVAE missing::Converting audiovae.pth failed. \
+          The demo still works, because its default weights source is the \
+          pre-quantized shi3z/VoxCPM2-q8 checkpoint, which already contains the \
+          AudioVAE. Only the optional full-precision source needs this file, and \
+          visitors picking it will be asked to supply one. Re-run this workflow \
+          once Hugging Face is reachable."
 
       - name: Assemble the site
         run: |
@@ -165,7 +167,8 @@ jobs:
           browser build cannot read a Python pickle. See MODEL-LICENSE.txt.
           NOTICE
           else
-            echo "WARNING: no audiovae.safetensors — the page will ask for one" >&2
+            echo "NOTE: no audiovae.safetensors — the default pre-quantized source" >&2
+            echo "      does not need one; only the full-precision source does." >&2
           fi
           # Pages runs Jekyll by default, which would skip paths it does
           # not like. This turns that off.

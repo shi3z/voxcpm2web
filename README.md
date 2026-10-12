@@ -30,27 +30,41 @@ the architecture walkthrough — is preserved at
 **https://shi3z.github.io/voxcpm2web/**
 
 Open it, press **Load model**, press **Generate**. Nothing to install,
-nothing to supply. All it asks of you is a GPU with enough VRAM (see
-[Requirements](#requirements)) and the patience for a 4.4 GB download.
+nothing to supply. It needs **an 8 GB GPU** and the patience for a
+2.45 GiB download.
 
 Where each piece comes from:
 
 | | |
 | --- | --- |
 | page + wasm | GitHub Pages, over HTTPS (WebGPU needs a secure context) |
-| `config.json`, `tokenizer.json`, `model.safetensors` | streamed from Hugging Face by HTTP Range |
-| `audiovae.safetensors` | served with the page |
+| `config.json`, `tokenizer.json`, `model.safetensors` | streamed from [`shi3z/VoxCPM2-q8`](https://huggingface.co/shi3z/VoxCPM2-q8) by HTTP Range |
+| the AudioVAE | already inside that `model.safetensors` |
 
-That last row is the awkward one. Upstream publishes the AudioVAE only as
-`audiovae.pth`, a Python pickle the browser build cannot read, and no
-`.safetensors` version is hosted anywhere public. So the deploy workflow
-converts it in CI and ships the 359 MB result alongside the page —
-VoxCPM2 is Apache-2.0 and not gated, so that is permitted, and the
-licence travels with it (`MODEL-LICENSE.txt`, `MODEL-NOTICE.txt`).
+The default source is a **pre-quantized INT8 repack** of
+[`openbmb/VoxCPM2`](https://huggingface.co/openbmb/VoxCPM2), published so
+the demo fits ordinary hardware. It exists because of two measurements:
 
-Without that the demo would not be a demo: it would only work for
-somebody who already had the converted file, which is nobody but the
-person who built it.
+- quantizing the full-precision checkpoint *in the browser* ends at the
+  same 2.9 GB of resident weights, but it has to download 4.37 GB to get
+  there, and peaks at **5.74 GiB** of GPU memory on the way;
+- loading the full-precision checkpoint unquantized peaks at
+  **9.65 GiB**, which is why this used to want a 12 GB card.
+
+The pre-quantized file peaks at **5.22 GiB**, generation included, and
+rolls the AudioVAE in — which also disposes of the one file that had no
+public host. Upstream publishes the AudioVAE only as `audiovae.pth`, a
+Python pickle the browser build cannot read, and no `.safetensors`
+version of it is hosted anywhere public.
+
+VoxCPM2 is Apache-2.0 and not gated, so republishing a numerically
+transformed copy is permitted; the licence travels with it, in the
+repository's `LICENSE` and model card.
+
+The full-precision source is still selectable in the page (*Weights
+source*) if you want to compare, and the deploy workflow still converts
+and ships `audiovae.safetensors` alongside the page so that path works
+too (`MODEL-LICENSE.txt`, `MODEL-NOTICE.txt`).
 
 ### Why the checkpoint is not hosted on GitHub
 
@@ -74,15 +88,27 @@ GET     .../model.safetensors   (Range: bytes=0-99)
 that preflight passing is the whole reason this works at all.
 
 Measured end to end, with the page on one origin and the checkpoint on
-Hugging Face: **474 s** to load, `applied=632, missing=0, unused=0,
-errors=0`. That is 4.4 GB over the public internet, so your mileage is
-your bandwidth. There is no local cache yet, so a reload re-downloads.
+Hugging Face, both sources verified this way:
+
+| source | size | load | result |
+| --- | --- | --- | --- |
+| `shi3z/VoxCPM2-q8` *(default)* | 2.45 GiB | 465 s | `applied=632, missing=0, unused=0, errors=0`, 2.90 GB on the GPU |
+| `openbmb/VoxCPM2` | 4.4 GB | 474 s | `applied=632, missing=0, unused=0, errors=0` |
+
+Both of those are bandwidth, not compute — the two runs happened to hit
+similar wall-clock times at different link speeds, so read them as "a few
+minutes on a home connection" rather than as a comparison. There is no
+local cache yet, so a reload re-downloads.
 
 The AudioVAE *is* small enough for Pages: ~359 MB plus ~23 MB of wasm
-sits well inside the 1 GB site limit. Pages' ~100 GB/month soft
-bandwidth cap works out to roughly 250 full loads a month — the 4.4 GB
-checkpoint comes from Hugging Face, not from here, so that is the only
-part this repo pays for.
+sits well inside the 1 GB site limit, and it is still deployed for the
+optional full-precision source.
+
+The default source no longer touches it, which is what makes the hosted
+demo cheap to run: a default visit pulls **~23 MB of wasm** from Pages
+and everything else from Hugging Face. Against Pages' ~100 GB/month soft
+bandwidth cap that is thousands of loads rather than the ~250 a month
+the 359 MB AudioVAE allowed.
 
 ### Feeding your own weights instead
 
@@ -159,15 +185,28 @@ paths. Browser performance on real GPU hardware is not yet measured.
 ## Requirements
 
 - **Chrome / Chromium 113+** (Edge works too). Safari is untested.
-- **A GPU with enough VRAM for the weights:**
+- **A GPU with enough VRAM.** Peak GPU memory, measured with
+  `nvidia-smi` across a whole run — load *and* generation, not just
+  resident weights:
 
-  | build | weights on GPU | needs |
+  | weights source | peak GPU | needs |
   | --- | --- | --- |
-  | F32 (default) | 8.74 GB | ≥ 12 GB VRAM |
-  | F16 (`--f16`) | 4.37 GB | ≥ 8 GB VRAM, adapter reports `shader-f16` |
+  | **pre-quantized Q8** *(demo default)* | **5.22 GiB** | **≥ 8 GB VRAM** |
+  | full precision + Q8 on load | 5.74 GiB | ≥ 8 GB VRAM |
+  | full precision, unquantized | 9.65 GiB | ≥ 12 GB VRAM |
 
-- **~4.8 GB of disk** for the checkpoint, and the patience to transfer it
-  to the browser once per page load (there is no local cache yet).
+  The two Q8 rows end at the same ~2.9 GB of resident weights; they
+  differ in what has to pass through the GPU to get there, and in
+  download size (2.45 GiB against 4.37 GB).
+
+  5.22 GiB leaves ~2.7 GB of an 8 GB card free, which is headroom but
+  not a lot of it: a desktop compositor and the browser's own GPU
+  process can account for 1–2 GB before the model starts. These numbers
+  were measured on an otherwise-idle card, so an 8 GB laptop running a
+  full desktop is the case most likely to be tight.
+
+- **~2.5 GB of transfer** per page load for the default source (there is
+  no local cache yet), or ~4.8 GB for the full-precision one.
 - A Rust toolchain with the `wasm32-unknown-unknown` target, to build.
 
 The demo **refuses to run on a software adapter** by default. Chrome
@@ -274,6 +313,7 @@ Measured, loading the result instead of the upstream checkpoint:
 | load time (native) | 30–35 s | **7.4 s** |
 | load time (browser) | 35.7 s | **9.1 s** |
 | GPU weights | 9.09 GB | 2.90 GB |
+| peak GPU, generation included | 9.65 GiB | **5.22 GiB** |
 | peak WASM heap | 2.0 GB | 1.4 GB |
 
 `applied=632, missing=0, unused=0, errors=0` either way, and the output
@@ -296,14 +336,31 @@ Two consequences worth knowing:
 - The AudioVAE is baked in, so there is no separate `audiovae.safetensors`
   to fetch — which also removes the one file that had no public host.
 
-### Why the hosted demo still downloads 4.4 GB
+### Where the pre-quantized checkpoint is hosted
 
-At 2.45 GiB a pre-quantized checkpoint **cannot go on GitHub Pages**,
-which caps a site at 1 GB. It needs a host that does CORS and Range —
-a Hugging Face repo works. Until one exists, point the page's *Base URL*
-at a directory containing a pre-quantized `model.safetensors` and it will
-detect and use it; `scripts/serve.py --model DIR --tailscale` is enough
-for your own machines.
+Not on GitHub: at 2.45 GiB it exceeds both the 100 MB per-file push limit
+and the 1 GB cap on a Pages site. It lives on Hugging Face instead, at
+[**`shi3z/VoxCPM2-q8`**](https://huggingface.co/shi3z/VoxCPM2-q8), and is
+the page's default *Weights source*.
+
+That host has to do two things, both verified rather than assumed:
+
+```
+OPTIONS .../model.safetensors   (Origin: https://shi3z.github.io, Request-Headers: range)
+  → 200, access-control-allow-origin: https://shi3z.github.io
+         access-control-allow-headers: range
+         access-control-expose-headers: ..., Accept-Ranges, Content-Range
+
+GET     .../model.safetensors   (Range: bytes=0-99)
+  → 206, content-range: bytes 0-99/2629105078
+         access-control-allow-origin: *
+```
+
+A local directory still works and still wins when present: point the
+page's *Base URL* at a directory containing a pre-quantized
+`model.safetensors` and the loader detects it from the manifest.
+`scripts/serve.py --model DIR --tailscale` is enough for your own
+machines.
 
 ## Switching between F32 and F16
 
@@ -347,9 +404,12 @@ is not safe.
 > localizes the fault. If you can run it on an F16-capable GPU, that
 > output plus the Diagnostics panel is exactly what is needed.
 
-F16 halves both the VRAM and the peak WASM heap, and is what makes this
-reach an 8 GB laptop GPU rather than needing a 12 GB card. It builds, and
-the bundle loads and runs matmuls, but its reductions are wrong (above).
+F16 halves both the VRAM and the peak WASM heap. It was originally the
+plan for reaching an 8 GB card; INT8 quantization got there first and
+more cheaply (5.22 GiB peak, measured), so F16 is no longer load-bearing
+for that — but halving the WASM heap is still worth having, and it would
+compose with Q8 rather than compete with it. It builds, and the bundle
+loads and runs matmuls, but its reductions are wrong (above).
 Before that was known, it could not be verified here at all, for a
 separate reason worth recording:
 

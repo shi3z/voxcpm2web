@@ -548,6 +548,38 @@ already registered server"* on a second call for the same device. Both
 retry after a refusal, so setup is cached while the guards are
 re-evaluated on every call.
 
+### B21 — B16 again, this time in the *reporting* code
+
+The same 32-bit `usize` trap as B16, found much later and in a far less
+obvious place: `QuantSurvey` counted parameter bytes in `usize`, and the
+Q8 figure it reports is
+
+```rust
+let bits = (survey.quantized_bytes * 8) / survey.quantized_params;
+```
+
+For this model `quantized_bytes` is about 2.04 × 10⁹, so the numerator is
+1.63 × 10¹⁰ — four times `usize::MAX` on `wasm32`. It wrapped, and the
+browser calmly reported a Q8 checkpoint as **"1 bits across 255
+tensors"**. Natively, with a 64-bit `usize`, the same code prints 8.
+
+Worth recording for two reasons:
+
+- **The totals were overflowing too, silently and conditionally.**
+  `total_bytes()` is ~3.0 GB quantized (fits) but ~9.1 GB unquantized
+  (does not). The number that was being displayed happened to be the one
+  that fit, so the bug looked like a cosmetic oddity in one field rather
+  than the arithmetic being wrong wherever it was not.
+- **It was invisible natively.** Every measurement of these counters in
+  this project was taken on the native backend, where they are correct.
+  The only way it surfaced was reading the browser's own metrics panel
+  after a successful load and noticing that 1 is not 8.
+
+Fixed by widening every counter in `QuantSurvey` to `u64` and moving the
+bits calculation into `QuantSurvey::bits_per_quantized_param`, so there
+is one place for it rather than an open-coded expression at each call
+site.
+
 ---
 
 ## 4c. Verification

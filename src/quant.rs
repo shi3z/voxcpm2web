@@ -124,16 +124,23 @@ impl QuantStats {
 }
 
 /// The measured state of a model's parameters.
+///
+/// Counted in `u64`, not `usize`, because `usize` is **32 bits** on
+/// `wasm32`: this model's parameters are 9.09 GB unquantized, and even the
+/// intermediate `bytes * 8` in [`Self::bits_per_quantized_param`] exceeds
+/// 2^32 for the quantized case. Both overflowed silently before — the
+/// browser reported "1 bits" for a Q8 checkpoint — which is the same
+/// 32-bit trap as blocker B16.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuantSurvey {
     /// Parameters stored quantized.
-    pub quantized_params: usize,
+    pub quantized_params: u64,
     /// Bytes those occupy, including their scales.
-    pub quantized_bytes: usize,
+    pub quantized_bytes: u64,
     /// Parameters still in floating point.
-    pub float_params: usize,
+    pub float_params: u64,
     /// Bytes those occupy.
-    pub float_bytes: usize,
+    pub float_bytes: u64,
     /// Number of quantized tensors.
     pub quantized_tensors: usize,
     /// Number of float tensors.
@@ -142,13 +149,23 @@ pub struct QuantSurvey {
 
 impl QuantSurvey {
     /// Total parameter bytes resident on the device.
-    pub fn total_bytes(&self) -> usize {
+    pub fn total_bytes(&self) -> u64 {
         self.quantized_bytes + self.float_bytes
     }
 
     /// Total in MiB.
     pub fn total_mib(&self) -> f64 {
         self.total_bytes() as f64 / 1048576.0
+    }
+
+    /// Effective bits per quantized parameter, scales included — so a
+    /// per-tensor Q8 scheme reads as 8 and a blocked one slightly above
+    /// its nominal width. Zero when nothing is quantized.
+    pub fn bits_per_quantized_param(&self) -> u64 {
+        if self.quantized_params == 0 {
+            return 0;
+        }
+        (self.quantized_bytes * 8) / self.quantized_params
     }
 }
 
@@ -163,7 +180,7 @@ impl<B: Backend> ModuleVisitor<B> for Surveyor {
         match tensor.dtype() {
             DType::QFloat(scheme) => {
                 self.survey.quantized_tensors += 1;
-                self.survey.quantized_params += elems;
+                self.survey.quantized_params += elems as u64;
                 let value_bits = scheme.value.size_bits();
                 // Plus the scales: one per tensor, or one per block.
                 let scales = match scheme.level {
@@ -173,22 +190,23 @@ impl<B: Backend> ModuleVisitor<B> for Surveyor {
                         elems.div_ceil(block.max(1))
                     }
                 };
-                let scale_bytes = match scheme.param {
+                let scale_bytes: u64 = match scheme.param {
                     burn::tensor::quantization::QuantParam::F32 => 4,
                     _ => 2,
                 };
-                self.survey.quantized_bytes += elems * value_bits / 8 + scales * scale_bytes;
+                self.survey.quantized_bytes +=
+                    (elems as u64) * (value_bits as u64) / 8 + (scales as u64) * scale_bytes;
             }
             other => {
                 self.survey.float_tensors += 1;
-                self.survey.float_params += elems;
-                self.survey.float_bytes += elems * dtype_bytes(other);
+                self.survey.float_params += elems as u64;
+                self.survey.float_bytes += elems as u64 * dtype_bytes(other);
             }
         }
     }
 }
 
-fn dtype_bytes(dt: DType) -> usize {
+fn dtype_bytes(dt: DType) -> u64 {
     match dt {
         DType::F64 | DType::I64 | DType::U64 => 8,
         DType::F32 | DType::Flex32 | DType::I32 | DType::U32 => 4,

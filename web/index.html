@@ -42,8 +42,9 @@
     <label class="field">
       <span>Weights source</span>
       <select id="source-preset">
+        <option value="hf-q8">Hugging Face, INT8 (2.45 GiB, AudioVAE included) — runs on an 8 GB GPU</option>
         <option value="local">Local server (/models) — needs scripts/serve.py</option>
-        <option value="hf">Hugging Face (streams the 4.37 GB checkpoint from openbmb/VoxCPM2)</option>
+        <option value="hf">Hugging Face, full precision (4.37 GB + a separate AudioVAE) — wants 12 GB</option>
       </select>
     </label>
     <label class="field">
