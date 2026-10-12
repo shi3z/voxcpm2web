@@ -803,6 +803,40 @@ pub async fn load_model(
     init_webgpu().await?;
     let device = Device::default();
 
+    // On an F16 build, prove reductions work before downloading gigabytes.
+    //
+    // This is not hypothetical caution. Two different GPUs — an RTX 3090
+    // and an Apple Metal-3 — have returned exactly 1.0 from *every* scalar
+    // reduction in the F16 bundle, whatever the input: `sum([1,2,3,4])`,
+    // `max([1,2,3,4])`, `sum([0,1,0,1,...][1024])`, all 1.0. Reductions
+    // back every RMSNorm and the stop head, so such a build generates
+    // confident-sounding garbage rather than failing. Refusing here turns
+    // that into a clear error, and costs microseconds.
+    //
+    // The user can still run the full self-test for the detail; this is
+    // the subset that is decisive, and it cannot be skipped.
+    if PRECISION == "f16" {
+        p.stage("init", "checking F16 reductions before downloading");
+        let probe = Tensor::<WebBackend, 1>::from_floats([1.0f32, 2.0, 3.0, 4.0], &device);
+        let got = probe
+            .sum()
+            .into_data_async()
+            .await
+            .map_err(|e| err(format!("F16 reduce check: readback failed: {e:?}")))?
+            .convert::<f32>()
+            .into_vec::<f32>()
+            .map_err(|_| err("F16 reduce check: unexpected dtype"))?
+            .first()
+            .copied()
+            .unwrap_or(f32::NAN);
+        if (got - 10.0).abs() > 0.1 {
+            return Err(err(format!(
+                "this F16 build computes reductions incorrectly on this device:                  sum([1,2,3,4]) returned {got}, not 10.\n\n                 Reductions back every RMSNorm and the stop head, so loading the                  model would produce wrong audio rather than no audio. Refusing                  instead.\n\n                 Use F32: append `?precision=f32` to the URL. F32 is verified to                  match a native run exactly.\n\n                 The bug is specific to the WGSL backend — the same reductions are                  correct in f16 on SPIR-V natively (`cargo run --release --example                  reduce_probe --no-default-features --features vulkan`). Running the                  self-test on this machine and reporting its output, together with                  the Diagnostics panel, is what would let it be fixed."
+            )));
+        }
+        log::info!("F16 reduce check passed (sum([1,2,3,4]) = {got})");
+    }
+
     // --- config.json ------------------------------------------------------
     let config_url = sources.resolve(&sources.config, "config.json")?;
     p.stage("config", &format!("downloading {config_url}"));

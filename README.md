@@ -142,7 +142,7 @@ on a machine only you can reach.
 | | |
 | --- | --- |
 | Compiles for `wasm32-unknown-unknown` | yes, with all native backends still building |
-| WebGPU compute in-browser | verified — 64×64 matmul and a reduce through Burn/cubecl |
+| WebGPU compute in-browser | verified — 64×64 matmul plus 24 reduce/quantization probes through Burn/cubecl (F32) |
 | Checkpoint loading in-browser | verified — both sources streamed by HTTP Range, `applied=632, missing=0, errors=0`: 2.45 GiB pre-quantized in 9.1 s, 4.37 GB full precision in 35.7 s (local server) |
 | The deployed demo end to end | verified — self-test and a full load from Hugging Face, on the published bundle |
 | Speech generation in-browser | verified — finite PCM at the correct length |
@@ -394,30 +394,69 @@ With `--both` deployed, the page's **Weight precision** selector offers:
 | --- | --- |
 | Auto *(default)* | **F32** — F16 is not selected automatically while its reduce bug stands |
 | F32 | 8.74 GB of VRAM. Verified to match a native run exactly |
-| F16 | 4.37 GB of VRAM. **Reductions are currently wrong** — see below. Refused outright if `shader-f16` is missing |
+| F16 | 4.37 GB of VRAM. **Reductions are currently wrong** — see below. Refused outright if `shader-f16` is missing, and `load_model` now refuses before downloading if a reduce check fails |
 
 Changing it reloads the page with `?precision=…`, because the GPU device
 is already registered with cubecl by then and swapping modules in place
 is not safe.
 
-> ### F16 is currently broken
+> ### F16 is currently broken — and the fault is in the WGSL path
 >
-> On the first run on real hardware WebGPU with `shader-f16`, the F16
-> build got **matmul right and reductions wrong**:
+> Two different GPUs, reported independently, return **exactly 1.0 from
+> every scalar reduction** in the F16 bundle, whatever the input. From an
+> Apple Metal-3 adapter (`shader-f16: true`):
 >
 > ```
-> self-test FAILED: reduce test FAILED: mean 1 != 2.5
+> sum([1,2,3,4])                1.0000   FAIL, expected 10
+> mean([1,2,3,4])               1.0000   FAIL, expected 2.5
+> max([1,2,3,4])                1.0000   FAIL, expected 4
+> min([1,2,3,4])                1.0000   ok          <- coincidence
+> sum([5,1,1,1])                1.0000   FAIL, expected 8
+> sum(ones[1024])               1.0000   FAIL, expected 1024
+> sum([0,1,0,1,...][1024])      1.0000   FAIL, expected 512
+> mean_dim([[1..4],[5..8]],1)   2.5000   ok  / 6.5000  ok
+> argmax([.1,.9,.3,.2])              1   ok
+> q8 matmul (expect 2.0)        0.0000   FAIL, 65536/65536 elements off
 > ```
 >
-> `mean([1,2,3,4])` returned `1`. Reductions back every RMSNorm and the
-> stop head, so this build does not produce quiet or missing audio — it
-> produces *wrong* audio. Auto therefore selects **F32**, and F16 is
-> opt-in with a warning until this is fixed.
+> That is a precise signature, and three things fall out of it:
 >
-> The self-test now runs 17 reduce probes (sum/mean/max/min, a length
-> sweep over `ones`, and argmax) and reports every value, so one run
-> localizes the fault. If you can run it on an F16-capable GPU, that
-> output plus the Diagnostics panel is exactly what is needed.
+> - It is **not** "returns element 0": `sum([5,1,1,1])` and
+>   `sum([0,1,0,1,…])` would then be 5 and 0.
+> - The operation does not matter — sum, mean, max and min all give 1.0.
+> - **`mean_dim` along an axis of a 2-D tensor is correct**, and so is
+>   `argmax`. Only reduce-*to-scalar* is wrong. Those are different
+>   `cubek-reduce` routines.
+>
+> Localized further by running the same probes natively, both element
+> types, via `examples/reduce_probe.rs`:
+>
+> ```
+> $ cargo run --release --example reduce_probe --no-default-features --features vulkan
+> === f32 ===            -> 0/24 probes failed
+> === f16 (half::f16) === -> 0/24 probes failed
+> ```
+>
+> **f16 reductions are correct on SPIR-V.** So this is not a bug in
+> burn/cubecl's reduce logic or in f16 arithmetic generally — it is
+> specific to the **WGSL** path. Which also explains why nobody caught
+> it: native `wgpu` refuses to compile an f16 kernel on this hardware
+> (below), so WGSL+f16 has no native test coverage at all and runs only
+> inside a browser.
+>
+> Reductions back every RMSNorm and the stop head, so this build does not
+> produce quiet or missing audio — it produces *wrong* audio. Three
+> guards stand between a user and that: Auto selects **F32**, selecting
+> F16 warns, and since the Metal report `load_model` itself runs
+> `sum([1,2,3,4])` on an F16 build and **refuses to download anything**
+> if the answer is not 10.
+>
+> What would move this forward is a run of the self-test on a device that
+> reports `shader-f16`, with the Diagnostics panel — specifically
+> `maxComputeInvocationsPerWorkgroup`, because routine selection depends
+> on it (256 on SwiftShader, 1024 on the Metal adapter above) and the
+> scalar-reduce routine chosen may differ from the one dumped in
+> `docs/browser-port-analysis.md`.
 
 F16 halves both the VRAM and the peak WASM heap. It was originally the
 plan for reaching an 8 GB card; INT8 quantization got there first and
@@ -440,7 +479,16 @@ driver, so the native WGSL path cannot run f16 at all — it fails in naga
 validation with *"Using `f16` values requires the
 `naga::valid::Capabilities::FLOAT16` flag"*. And the test machine's
 browser only ever got a SwiftShader adapter, which has no `shader-f16`
-either. So neither route to verification was available here.
+either, so the F16 bundle refuses to run there as well. Neither route to
+verification is available here.
+
+cubecl's *own* Vulkan backend is the exception, and it is why
+`reduce_probe --features vulkan` can test f16 at all: it drives Vulkan
+through `ash` directly and enables the f16 extensions itself rather than
+going through `wgpu`'s feature gating (`cubecl-wgpu` even does
+`features.remove(Features::SHADER_F16)` there, to add the types back
+manually alongside `u8`/`i8`). SPIR-V, not WGSL — which is exactly why
+it passes while the browser fails.
 
 Note that the native failure does **not** imply the browser build is
 broken: native `wgpu` validates WGSL through naga, whereas in a browser

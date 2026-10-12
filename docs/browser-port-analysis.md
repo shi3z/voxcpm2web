@@ -580,6 +580,78 @@ bits calculation into `QuantSurvey::bits_per_quantized_param`, so there
 is one place for it rather than an open-coded expression at each call
 site.
 
+### B22 — f16 reduce-to-scalar is wrong, and only on WGSL *(open)*
+
+The F16 bundle returns **exactly 1.0 from every scalar reduction**,
+independent of input and of operation. Reported from an Apple Metal-3
+adapter and, earlier, from an RTX 3090:
+
+```
+sum([1,2,3,4])             1.0000   FAIL, expected 10
+mean([1,2,3,4])            1.0000   FAIL, expected 2.5
+max([1,2,3,4])             1.0000   FAIL, expected 4
+sum([5,1,1,1])             1.0000   FAIL, expected 8
+sum(ones[1024])            1.0000   FAIL, expected 1024
+sum([0,1,0,1,...][1024])   1.0000   FAIL, expected 512
+mean_dim(...)              2.5000 / 6.5000   ok
+argmax([.1,.9,.3,.2])           1   ok
+q8 matmul                  0.0000   FAIL, 65536/65536 off
+```
+
+What the signature rules out:
+
+- **Not "returns element 0".** That would give 5 for `[5,1,1,1]` and 0
+  for `[0,1,0,1,…]`.
+- **Not operation-specific.** sum, mean, max and min all give 1.0.
+- **Not all of reduce.** `mean_dim` down an axis of a 2-D tensor is
+  correct, and `argmax` is correct. Only reduce-to-scalar is wrong, and
+  those are different `cubek-reduce` routines.
+
+Narrowed by `examples/reduce_probe.rs`, which runs the browser
+self-test's probe set natively for both element types:
+
+| backend | f32 | f16 |
+|---|---|---|
+| `vulkan` (SPIR-V, via cubecl's own `ash` backend) | 24/24 pass | **24/24 pass** |
+| `wgpu` (WGSL, via naga) | 24/24 pass | **does not compile** |
+| browser WebGPU (WGSL, via Dawn) | 24/24 pass | **14 probes fail** |
+
+So f16 arithmetic and the reduce logic are both fine; the fault is in the
+**WGSL** lowering of reduce-to-scalar. The middle row is why it went
+unnoticed for so long: `wgpu` 26 does not advertise `SHADER_F16` on this
+driver, so WGSL+f16 fails naga validation natively (*"Using `f16` values
+requires the `naga::valid::Capabilities::FLOAT16` flag"*) and therefore
+**runs only inside a browser**. There is no native configuration that
+exercises it.
+
+The generated WGSL *can* be inspected without running it, because cubecl
+emits the source before validation rejects it:
+
+```sh
+CUBECL_DEBUG_LOG=/tmp/wgsl.log   cargo run --release --example reduce_probe --no-default-features --features wgpu
+```
+
+On this machine that selects the **Unit** routine — `line_mode: Parallel`,
+`cube_dim 32×1×1`, `input_dtype F16`, `acc_dtype F32`, input `line_size
+4`, output `line_size 1` — and the emitted kernel reads correct on
+inspection: it accumulates `vec4<f16>` lines into a `vec4<f32>`,
+horizontally sums the four lanes, converts back with `f16(...)` and
+stores. Nothing there explains a constant 1.0.
+
+That is as far as static inspection goes, and the reason is worth
+recording: **routine selection depends on device properties**.
+`maxComputeInvocationsPerWorkgroup` is 256 on SwiftShader and 1024 on
+the Metal adapter that failed, so the kernel the Mac actually ran is
+probably not the one dumped above — the `shared_sum` or plane routine is
+the likelier candidate, and plane routines use subgroup intrinsics.
+Confirming that needs a device that reports `shader-f16`, which is
+exactly what is unavailable here.
+
+Mitigation, since the bug cannot be fixed blind: `load_model` runs
+`sum([1,2,3,4])` on an F16 build before fetching anything and refuses
+with this explanation if the answer is not 10. Wrong audio was the
+failure mode; a refusal is not.
+
 ---
 
 ## 4c. Verification
